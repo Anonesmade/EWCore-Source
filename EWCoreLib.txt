@@ -1,0 +1,2867 @@
+// =====================================================================================
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Wick-Sniper
+//
+// EWCoreLib — Elliott Wave Pattern Evaluation Library for EWCore
+//
+// PART OF A THREE-SCRIPT SET — the three are developed, versioned and published
+// together:
+//   EWCore             the Elliott Wave indicator: pivot detection, pattern search,
+//                      scoring, labelling, targets and invalidation levels
+//   EWCoreLib          the library EWCore imports; pattern validation and scoring
+//                      functions, no chart output of its own
+//   EWCore Docs        on-chart help and reference panel for EWCore; displays
+//                      reference text only and calculates nothing
+// EWCoreLib is required for EWCore to work. TradingView loads it automatically
+// when EWCore is added to a chart — no separate installation or setup is needed.
+// EWCore Docs is optional and is only useful alongside EWCore.
+//
+// DISCLAIMER
+// Technical analysis tooling — not financial advice, not a buy/sell signal
+// generator, and not a tested trading strategy.
+//
+// Elliott Wave analysis is a theory about recurring patterns in market behaviour,
+// not a physical law. The "hard rules" enforced here are rules of the counting
+// METHOD; they are not a claim that price is obliged to follow them. Documented
+// exceptions exist within the theory itself, and experienced analysts routinely
+// reach different, equally rule-consistent counts on the same chart. A count that
+// satisfies every rule checked is one internally consistent reading among several
+// that may be possible — never a guarantee of future price behaviour. Every
+// trading decision, and its outcome, remains the user's own.
+//
+// This library has no chart output and makes no trading decision. It returns
+// validation and scoring results to a calling script; interpreting them is that
+// script's responsibility.
+// =====================================================================================
+//@version=6
+// EWCoreLib v0.1.1.3
+library("EWCoreLib", overlay = false)
+
+export type WaveCount
+    string countId
+    string degreeLabel
+    bool   hardRulesPassed
+    bool   wave4Overlap
+    bool   isUp
+    float  scoreTotal
+    float  scoreFib
+    float  scoreAlternation
+    float  scoreEquality
+    float  scoreTime
+    float  scoreMTF
+    float  invalidationLevel
+    string confidenceTier
+    string patternType
+    bool   possibleCombination
+    int    numPoints
+    float  w1s
+    float  w1e
+    float  w2e
+    float  w3e
+    float  w4e
+    float  w5e
+    int    w1eBar
+    int    w2eBar
+    int    w3eBar
+    int    w4eBar
+    int    w5eBar
+    int    startIdx
+    string comboStructure
+    int    degree
+    int    endBar
+    bool   anchoredStart
+    int    legsConsumed
+    float  scoreMomentum
+    string extInfo
+
+export type EngineConfig
+    float tolWave2Pct
+    float tolWave3Pct
+    float tolWave4Pct
+    float tolCorrectiveBPct
+    float tolMaxMalus
+    float wFib
+    float wAlt
+    float wEq
+    float wTime
+    float wMTF
+    float wMomentum
+    bool  enableSubWaveCheck
+    bool  strictLegValidation
+    bool  enableExtensionFamily
+    float extScoreMargin
+    bool  ruleAwareCompress
+    float extMinRawPerWave
+    int   anchorLookback
+    int   dirD1
+    int   dirH4
+    int   maxBarsBackSafe
+    array<float> retracementLevels
+    array<float> extensionLevels
+    array<float> timeLevels
+    array<float> contractLevels
+    array<float> expandLevels
+    float tolCEndPct
+    float comboTimeCap
+    float comboSubLegCap
+
+f_softRuleTol(bool hardPass, float violationPct, float tolerancePct, float maxMalus) =>
+    bool passResult = hardPass
+    float malus = 0.0
+    if not hardPass and tolerancePct > 0
+        if violationPct <= tolerancePct
+            passResult := true
+            malus := (violationPct / tolerancePct) * maxMalus
+    [passResult, malus]
+
+f_joinExt(string a, string b) =>
+    a + (str.length(a) > 0 and str.length(b) > 0 ? "," : "") + b
+
+f_truncRekey(string src, int newNo) =>
+    string out = ""
+    if str.length(src) > 0
+        array<string> parts = str.split(src, ",")
+        int nParts = array.size(parts)
+        for pi = 0 to (nParts > 0 ? nParts - 1 : 0)
+            array<string> f = nParts > 0 ? str.split(array.get(parts, pi), ":") : array.new_string(0)
+            if array.size(f) == 3 and str.startswith(array.get(f, 0), "T")
+                out := array.get(f, 0) + ":" + str.tostring(newNo) + ":" + array.get(f, 2)
+    out
+
+f_truncRecords(string src) =>
+    string out = ""
+    if str.length(src) > 0
+        array<string> parts = str.split(src, ",")
+        int nParts = array.size(parts)
+        for pi = 0 to (nParts > 0 ? nParts - 1 : 0)
+            string rec = nParts > 0 ? array.get(parts, pi) : ""
+            if str.startswith(rec, "T") and array.size(str.split(rec, ":")) == 3
+                out := f_joinExt(out, rec)
+    out
+
+f_maxLegDur(array<int> pBr, int fromIdx, int legs) =>
+    int mx = 0
+    for k = fromIdx to fromIdx + legs - 1
+        mx := math.max(mx, array.get(pBr, k + 1) - array.get(pBr, k))
+    mx
+
+f_comboProportionOk(int durComp, int maxSubComp, int durRef, EngineConfig cfg) =>
+    bool timeOk = cfg.comboTimeCap <= 0 or durRef <= 0 or durComp <= cfg.comboTimeCap * durRef
+    bool subOk = cfg.comboSubLegCap <= 0 or durRef <= 0 or maxSubComp <= cfg.comboSubLegCap * durRef
+    timeOk and subOk
+
+export subLowerBound(array<int> vBars, int bar) =>
+    int lo = 0
+    int hi = array.size(vBars)
+    while lo < hi
+        int mid = int((lo + hi) / 2)
+        if array.get(vBars, mid) <= bar
+            lo := mid + 1
+        else
+            hi := mid
+    lo
+
+export f_barValToTime(array<int> vBars, array<int> vTimes, int barVal) =>
+    int idx = subLowerBound(vBars, barVal) - 1
+    (idx >= 0 and idx < array.size(vTimes) and array.get(vBars, idx) == barVal) ? array.get(vTimes, idx) : na
+
+export getLabelSize(string s) =>
+    switch s
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        "huge"   => size.huge
+        => size.normal
+
+export f_lineStyle(string s) =>
+    switch s
+        "Solid"  => line.style_solid
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+export f_patternExplanation(string patternType, string comboStruct, float p0, float p1, float p2, float p3, float p4, float p5) =>
+    string expl = "Unclassified structure"
+    float len1 = math.abs(p1 - p0)
+    float len2 = math.abs(p2 - p1)
+    float len3 = math.abs(p3 - p2)
+    float len4 = na(p4) ? na : math.abs(p4 - p3)
+    float len5 = na(p5) ? na : math.abs(p5 - p4)
+    float ratio2 = len1 > 0 ? len2 / len1 * 100 : 0.0
+    float ratio4 = (not na(len4) and len3 > 0) ? len4 / len3 * 100 : 0.0
+
+    if patternType == "Impulse"
+        expl := "Impulse: wave 2 retraced " + str.tostring(ratio2, "#.#") + "% of wave 1, wave 4 retraced " +
+             str.tostring(ratio4, "#.#") + "% of wave 3, wave 3 exceeds wave 1, no wave-1/4 overlap"
+    else if str.startswith(patternType, "Diagonal")
+        string posNote = str.contains(patternType, "Ending w5") ?
+             " Position: wave-5 of the preceding 1-2-3-4 — a termination point; expect a sharp reversal on completion." :
+             str.contains(patternType, "Ending wC") ?
+             " Position: wave-C of a preceding A-B — a termination point; expect a sharp reversal on completion." :
+             str.contains(patternType, "Leading") ?
+             " Position: start of a new move (wave 1/A) — typically followed by a deep retracement, then continuation." :
+             " Position: not classifiable from available context (Leading vs Ending needs the surrounding structure)."
+        expl := patternType + ": wave 2 retraced " + str.tostring(ratio2, "#.#") + "% of wave 1, wave 4 retraced " +
+             str.tostring(ratio4, "#.#") + "% of wave 3 — wave 4 overlaps wave 1 (the defining trait of a diagonal, unlike an impulse)." + posNote
+    else if patternType == "Zigzag" or patternType == "Flat"
+        expl := patternType + ": wave B retraced " + str.tostring(ratio2, "#.#") + "% of wave A" +
+             (patternType == "Zigzag" ? " — sharp correction, <=78.6% retrace against the larger trend" : " — near-100% retrace, sideways correction")
+    else if str.startswith(patternType, "Triangle")
+        float lA = len1
+        float lB = len2
+        float lC = len3
+        float lD = na(len4) ? na : len4
+        float shrinkAC = lA > 0 ? lC / lA * 100 : 100.0
+        float shrinkBD = (not na(lD) and lB > 0) ? lD / lB * 100 : 100.0
+        expl := patternType + ": leg C is " + str.tostring(shrinkAC, "#.#") + "% of leg A, leg D is " +
+             str.tostring(shrinkBD, "#.#") + "% of leg B (5-leg sideways structure, A-B-C-D-E)"
+    else if patternType == "Combination (WXY)"
+        float wNet = len1
+        float xNet = len2
+        float yNetTotal = math.abs(p3 - p0)
+        float xRatioD = wNet > 0 ? xNet / wNet * 100 : 0.0
+        float extendPct = wNet > 0 ? (yNetTotal / wNet - 1) * 100 : 0.0
+        string compNote = ""
+        if comboStruct != ""
+            array<string> parts = str.split(comboStruct, "|")
+            array<string> wPart = str.split(array.get(parts, 0), ":")
+            array<string> yPart = str.split(array.get(parts, 2), ":")
+            string yName = array.get(yPart, 1)
+            compNote := " Components: W is a " + array.get(wPart, 1) + ", Y is a " + yName +
+                 (yName == "Triangle" ? " (a triangle is allowed only as the final component)" : "") + "."
+        expl := "Double Three: connecting X wave retraced " + str.tostring(xRatioD, "#.#") + "% of W's move; " +
+             "combined W-X-Y ends " + str.tostring(extendPct, "#.#") + "% beyond W alone — the doubling extends the duration of the correction (largely sideways in character)." + compNote
+    else if patternType == "Combination (WXYXZ)"
+        float wNet = len1
+        float x1Net = len2
+        float yNetTotal = math.abs(p3 - p0)
+        float x1RatioD = wNet > 0 ? x1Net / wNet * 100 : 0.0
+        float extendPctY = wNet > 0 ? (yNetTotal / wNet - 1) * 100 : 0.0
+        float zNetTotal = na(p5) ? na : math.abs(p5 - p0)
+        float extendPctZ = (wNet > 0 and not na(zNetTotal)) ? (zNetTotal / wNet - 1) * 100 : 0.0
+        string compNote5 = ""
+        if comboStruct != ""
+            array<string> parts5 = str.split(comboStruct, "|")
+            array<string> wPart5 = str.split(array.get(parts5, 0), ":")
+            array<string> yPart5 = str.split(array.get(parts5, 2), ":")
+            array<string> zPart5 = str.split(array.get(parts5, 4), ":")
+            string zName = array.get(zPart5, 1)
+            compNote5 := " Components: W is a " + array.get(wPart5, 1) + ", Y is a " + array.get(yPart5, 1) + ", Z is a " + zName +
+                 (zName == "Triangle" ? " (a triangle is allowed only as the final component)" : "") + "."
+        expl := "Triple Three: per EW_NEW.pdf this 'may exist only in theory'. Connecting wave X1 retraced " + str.tostring(x1RatioD, "#.#") + "% of W's move; " +
+             "W-X-Y extends " + str.tostring(extendPctY, "#.#") + "% beyond W, and the full structure extends " + str.tostring(extendPctZ, "#.#") + "% beyond W — each doubling further extends the correction's duration (still sideways in character)." + compNote5
+    expl
+
+export f_dpEdgeModifier(array<WaveCount> candPool, array<int> dpCandIdx, int k, WaveCount c, bool grammarEnabled, float grammarBonus, float grammarMalus, bool comboEnabled, float comboBonusVal) =>
+    float grammarDelta = 0.0
+    if grammarEnabled
+        int prevCi = array.get(dpCandIdx, k)
+        if prevCi >= 0 and prevCi < array.size(candPool)
+            WaveCount prevC = array.get(candPool, prevCi)
+            bool prevMotive = prevC.patternType == "Impulse" or str.startswith(prevC.patternType, "Diagonal")
+            bool curMotive  = c.patternType == "Impulse" or str.startswith(c.patternType, "Diagonal")
+            grammarDelta := prevMotive != curMotive ? grammarBonus : -grammarMalus
+    float comboDelta = (comboEnabled and str.startswith(c.patternType, "Combination")) ? comboBonusVal : 0.0
+    grammarDelta + comboDelta
+
+fibConformityScore(float ratio, array<float> levels) =>
+    float minDev = 999999.0
+    for i = 0 to array.size(levels) - 1
+        lvl = array.get(levels, i)
+        dev = math.abs(ratio - lvl)
+        if dev < minDev
+            minDev := dev
+    math.max(0.0, 100.0 - minDev * 200.0)
+
+mtfAlignScore(bool isUp, int dirD1, int dirH4) =>
+    float s = 0.0
+    if isUp
+        s := (dirD1 == 1 ? 60.0 : 0.0) + (dirH4 == 1 ? 40.0 : 0.0)
+    else
+        s := (dirD1 == -1 ? 60.0 : 0.0) + (dirH4 == -1 ? 40.0 : 0.0)
+    s
+
+f_momentumScore(array<int> pBr, int degree, int startIdx, int numPts, string patternType, float rsiSeries, int maxBarsBackSafe, bool computeMomentum) =>
+    float score = 50.0
+    var array<float> rv  = array.new_float(0)
+    var array<float> rv2 = array.new_float(0)
+    if computeMomentum and degree == 1 and numPts >= 3
+        bool isMotive = patternType == "Impulse" or str.contains(patternType, "Diagonal")
+        bool isCorrective3 = numPts == 3 and (patternType == "Zigzag" or str.contains(patternType, "Flat"))
+        if isMotive and numPts >= 5
+            int bFirst = array.get(pBr, startIdx)
+            if bar_index - bFirst < maxBarsBackSafe
+                array.clear(rv)
+                for k = 0 to 5
+                    int bk = array.get(pBr, startIdx + k)
+                    array.push(rv, rsiSeries[bar_index - bk])
+                if not na(array.get(rv, 0)) and not na(array.get(rv, 5))
+                    float sw1 = math.abs(array.get(rv, 1) - array.get(rv, 0))
+                    float sw3 = math.abs(array.get(rv, 3) - array.get(rv, 2))
+                    float sw5 = math.abs(array.get(rv, 5) - array.get(rv, 4))
+                    float swMax = math.max(sw1, math.max(sw3, sw5))
+                    if swMax > 0
+                        score := math.min(100.0, (sw3 / swMax) * 100.0)
+        else if isCorrective3
+            int bFirst2 = array.get(pBr, startIdx)
+            if bar_index - bFirst2 < maxBarsBackSafe
+                array.clear(rv2)
+                for k = 0 to 3
+                    int bk2 = array.get(pBr, startIdx + k)
+                    array.push(rv2, rsiSeries[bar_index - bk2])
+                if not na(array.get(rv2, 0)) and not na(array.get(rv2, 3))
+                    float swA = math.abs(array.get(rv2, 1) - array.get(rv2, 0))
+                    float swC = math.abs(array.get(rv2, 3) - array.get(rv2, 2))
+                    float swMaxAC = math.max(swA, swC)
+                    if swMaxAC > 0
+                        score := math.min(100.0, (swC / swMaxAC) * 100.0)
+    score
+
+barsStrictlyRising(array<int> pBr, int startIdx, int legs) =>
+    bool okB = true
+    for k = startIdx to startIdx + legs - 1
+        if array.get(pBr, k + 1) <= array.get(pBr, k)
+            okB := false
+    okB
+
+anchoredStart(array<float> pP, int startIdx, bool p0IsLow, int lookback) =>
+    bool anch = true
+    if startIdx > 0
+        float p0 = array.get(pP, startIdx)
+        for k = math.max(0, startIdx - lookback) to startIdx - 1
+            float v = array.get(pP, k)
+            if p0IsLow ? v < p0 : v > p0
+                anch := false
+    anch
+
+evaluateImpulseWindowCore(array<float> pP, array<int> pBr, int degree, int startIdx, EngineConfig cfg, float rsiSeries, bool computeMomentum) =>
+    float s0 = array.get(pP, startIdx)
+    float e1 = array.get(pP, startIdx + 1)
+    float e2 = array.get(pP, startIdx + 2)
+    float e3 = array.get(pP, startIdx + 3)
+    float e4 = array.get(pP, startIdx + 4)
+    float e5 = array.get(pP, startIdx + 5)
+    int   b0 = array.get(pBr, startIdx)
+    int   b1 = array.get(pBr, startIdx + 1)
+    int   b2 = array.get(pBr, startIdx + 2)
+    int   b3 = array.get(pBr, startIdx + 3)
+    int   b4 = array.get(pBr, startIdx + 4)
+    int   b5 = array.get(pBr, startIdx + 5)
+
+    bool isUp = e1 > s0
+    float len1 = math.abs(e1 - s0)
+    float len3 = math.abs(e3 - e2)
+    float len5 = math.abs(e5 - e4)
+    float wave03Len = math.abs(e3 - s0)
+
+    bool r1 = isUp ? (e2 > s0) : (e2 < s0)
+    bool r2 = not (len3 < len1 and len3 < len5)
+    bool r3 = isUp ? (e4 > e1) : (e4 < e1)
+    bool r4 = isUp ? (e4 > e2) : (e4 < e2)
+    bool r5 = isUp ? (e3 > e1) : (e3 < e1)
+    float r1ViolPct = len1 > 0 ? math.max(0.0, (isUp ? (s0 - e2) : (e2 - s0)) / len1 * 100.0) : 100.0
+    float minLen15 = math.min(len1, len5)
+    float r2ViolPct = minLen15 > 0 ? math.max(0.0, (minLen15 - len3) / minLen15 * 100.0) : 0.0
+    float r5ViolPct = len1 > 0 ? math.max(0.0, (isUp ? (e1 - e3) : (e3 - e1)) / len1 * 100.0) : 100.0
+    float r3ViolPct = len1 > 0 ? math.max(0.0, (isUp ? (e1 - e4) : (e4 - e1)) / len1 * 100.0) : 100.0
+    [r1Pass, r1Malus] = f_softRuleTol(r1, r1ViolPct, cfg.tolWave2Pct, cfg.tolMaxMalus)
+    [r2Pass, r2Malus] = f_softRuleTol(r2, r2ViolPct, cfg.tolWave3Pct, cfg.tolMaxMalus)
+    [r5Pass, r5Malus] = f_softRuleTol(r5, r5ViolPct, cfg.tolWave3Pct, cfg.tolMaxMalus)
+    [r3Pass, r3Malus] = f_softRuleTol(r3, r3ViolPct, cfg.tolWave4Pct, cfg.tolMaxMalus)
+    float toleranceMalus = r1Malus + r2Malus + r5Malus + r3Malus
+    bool overlap = not r3Pass
+    bool valid = r1Pass and r2Pass and r4 and r3Pass and r5Pass and barsStrictlyRising(pBr, startIdx, 5)
+    bool fifthShort = isUp ? e5 <= e3 : e5 >= e3
+    float t5Pct = len3 > 0 ? math.max(0.0, (isUp ? e3 - e5 : e5 - e3) / len3 * 100.0) : 0.0
+    string tInfo = fifthShort ? "T5:5:" + str.tostring(t5Pct, "#.#") : ""
+
+    float score2 = len1 > 0 ? fibConformityScore(math.abs(e2 - e1) / len1, cfg.retracementLevels) : 50.0
+    float score4 = len3 > 0 ? fibConformityScore(math.abs(e4 - e3) / len3, cfg.retracementLevels) : 50.0
+    float score3ext = len1 > 0 ? fibConformityScore(len3 / len1, cfg.extensionLevels) : 50.0
+    float score5ext = wave03Len > 0 ? fibConformityScore(len5 / wave03Len, cfg.extensionLevels) : 50.0
+    float fibScore = (score2 + score4 + score3ext + score5ext) / 4.0
+
+    float steep2 = (b2 - b1) > 0 ? math.abs(e2 - e1) / (b2 - b1) : 0.0
+    float steep4 = (b4 - b3) > 0 ? math.abs(e4 - e3) / (b4 - b3) : 0.0
+    float maxSteep = math.max(steep2, steep4)
+    float altScoreRaw = maxSteep > 0 ? math.min(100.0, (math.abs(steep2 - steep4) / maxSteep) * 100.0) : 50.0
+
+    float ratioEq = (len5 > 0 and len1 > 0) ? math.min(len1, len5) / math.max(len1, len5) : 0.0
+    float eqScore = math.max(0.0, 100.0 - math.min(math.abs(ratioEq - 1.0), math.abs(ratioEq - 0.618)) * 150.0)
+
+    int durW1 = b1 - b0
+    int durW5 = b5 - b4
+    float ratioT = durW1 > 0 ? durW5 / float(durW1) : 0.0
+    float timeScore = durW1 > 0 ? fibConformityScore(ratioT, cfg.timeLevels) : 50.0
+
+    float mtfScore = mtfAlignScore(isUp, cfg.dirD1, cfg.dirH4)
+    float momScore = f_momentumScore(pBr, degree, startIdx, 5, "Impulse", rsiSeries, cfg.maxBarsBackSafe, computeMomentum)
+    float scoreTotal = fibScore * cfg.wFib + altScoreRaw * cfg.wAlt + eqScore * cfg.wEq + timeScore * cfg.wTime + mtfScore * cfg.wMTF + momScore * cfg.wMomentum - toleranceMalus
+
+    string tier = scoreTotal > 80 ? "high" : scoreTotal >= 60 ? "moderate" : "low"
+    string cid = (degree == 2 ? "2-" : "") + "I" + str.tostring(startIdx)
+    string dlabel = (isUp ? "Impulse bullish (window " : "Impulse bearish (window ") + str.tostring(startIdx) + ")"
+    float invLevel = e1
+
+    bool anchored = anchoredStart(pP, startIdx, isUp, cfg.anchorLookback)
+    WaveCount.new(cid, dlabel, valid, overlap, isUp, scoreTotal, fibScore, altScoreRaw, eqScore, timeScore, mtfScore,
+         invLevel, tier, "Impulse", false, 5, s0, e1, e2, e3, e4, e5, b1, b2, b3, b4, b5, startIdx, "", degree, b5, anchored, 5, momScore, tInfo)
+
+evaluateDiagonalWindowCore(array<float> pP, array<int> pBr, int degree, int startIdx, EngineConfig cfg, float rsiSeries, bool computeMomentum) =>
+    float s0 = array.get(pP, startIdx)
+    float e1 = array.get(pP, startIdx + 1)
+    float e2 = array.get(pP, startIdx + 2)
+    float e3 = array.get(pP, startIdx + 3)
+    float e4 = array.get(pP, startIdx + 4)
+    float e5 = array.get(pP, startIdx + 5)
+    int   b0 = array.get(pBr, startIdx)
+    int   b1 = array.get(pBr, startIdx + 1)
+    int   b2 = array.get(pBr, startIdx + 2)
+    int   b3 = array.get(pBr, startIdx + 3)
+    int   b4 = array.get(pBr, startIdx + 4)
+    int   b5 = array.get(pBr, startIdx + 5)
+
+    bool isUp = e1 > s0
+    float len1 = math.abs(e1 - s0)
+    float len3 = math.abs(e3 - e2)
+    float len5 = math.abs(e5 - e4)
+
+    bool r1 = isUp ? (e2 > s0) : (e2 < s0)
+    bool r2 = not (len3 < len1 and len3 < len5)
+    bool r4 = isUp ? (e4 > e2) : (e4 < e2)
+    bool r5 = isUp ? (e3 > e1) : (e3 < e1)
+    bool overlapsW1 = isUp ? (e4 < e1) : (e4 > e1)
+
+    bool contracting = len3 < len1 and len5 < len3
+    bool expanding = len3 > len1 and len5 > len3
+    bool valid = r1 and r2 and r4 and r5 and overlapsW1 and (contracting or expanding) and barsStrictlyRising(pBr, startIdx, 5)
+    bool fifthShort = isUp ? e5 <= e3 : e5 >= e3
+    float t5Pct = len3 > 0 ? math.max(0.0, (isUp ? e3 - e5 : e5 - e3) / len3 * 100.0) : 0.0
+    string tInfo = fifthShort ? "T5:5:" + str.tostring(t5Pct, "#.#") : ""
+
+    string positionCtx = ""
+    if startIdx >= 4
+        float q0 = array.get(pP, startIdx - 4)
+        float q1 = array.get(pP, startIdx - 3)
+        float q2 = array.get(pP, startIdx - 2)
+        float q3 = array.get(pP, startIdx - 1)
+        bool ctxUp = q1 > q0
+        if ctxUp == isUp
+            float cL1 = math.abs(q1 - q0)
+            float cL3 = math.abs(q3 - q2)
+            float cL5 = math.abs(e5 - s0)
+            bool c1 = ctxUp ? q2 > q0 : q2 < q0
+            bool c3 = ctxUp ? q3 > q1 : q3 < q1
+            bool c4 = ctxUp ? s0 > q2 : s0 < q2
+            bool cNotShortest = not (cL3 < cL1 and cL3 < cL5)
+            if c1 and c3 and c4 and cNotShortest
+                positionCtx := "Ending w5"
+    if positionCtx == "" and startIdx >= 2
+        float qa0 = array.get(pP, startIdx - 2)
+        float qa1 = array.get(pP, startIdx - 1)
+        bool aUp = qa1 > qa0
+        if aUp == isUp
+            float ctxLenA = math.abs(qa1 - qa0)
+            float ctxLenB = math.abs(s0 - qa1)
+            float ctxRatioB = ctxLenA > 0 ? ctxLenB / ctxLenA : 0.0
+            if ctxRatioB > 0.1 and ctxRatioB < 1.38
+                positionCtx := "Ending wC"
+    if positionCtx == "" and startIdx >= 4
+        bool p0IsExtreme = true
+        for k = startIdx - 4 to startIdx - 1
+            float qv = array.get(pP, k)
+            if isUp ? qv < s0 : qv > s0
+                p0IsExtreme := false
+        if p0IsExtreme
+            positionCtx := "Leading"
+    if positionCtx == ""
+        positionCtx := expanding ? "Leading?" : "Ending?"
+
+    string shapeStr = contracting ? "contracting" : expanding ? "expanding" : "irregular"
+    string ptype = "Diagonal (" + (positionCtx != "" ? positionCtx + ", " : "") + shapeStr + ")"
+
+    float score2 = len1 > 0 ? fibConformityScore(math.abs(e2 - e1) / len1, cfg.retracementLevels) : 50.0
+    float score4 = len3 > 0 ? fibConformityScore(math.abs(e4 - e3) / len3, cfg.retracementLevels) : 50.0
+    float fibScore = (score2 + score4) / 2.0
+
+    float r13 = len1 > 0 ? len3 / len1 : 1.0
+    float r35 = len3 > 0 ? len5 / len3 : 1.0
+    float avgR = (r13 + r35) / 2.0
+    float spread = math.abs(r13 - avgR) + math.abs(r35 - avgR)
+    float formPenalty = str.startswith(positionCtx, "Ending") and expanding ? 12.0 : 0.0
+    float structScoreRaw = math.max(0.0, 100.0 - spread * 100.0 - formPenalty)
+
+    float ratioEq = (len5 > 0 and len1 > 0) ? math.min(len1, len5) / math.max(len1, len5) : 0.0
+    float eqScore = math.max(0.0, 100.0 - math.abs(ratioEq - 1.0) * 100.0)
+
+    int durW1 = b1 - b0
+    int durW5 = b5 - b4
+    float ratioT = durW1 > 0 ? durW5 / float(durW1) : 0.0
+    float timeScore = durW1 > 0 ? fibConformityScore(ratioT, cfg.timeLevels) : 50.0
+
+    float mtfScore = mtfAlignScore(isUp, cfg.dirD1, cfg.dirH4)
+    float momScore = f_momentumScore(pBr, degree, startIdx, 5, ptype, rsiSeries, cfg.maxBarsBackSafe, computeMomentum)
+    float scoreTotal = fibScore * cfg.wFib + structScoreRaw * cfg.wAlt + eqScore * cfg.wEq + timeScore * cfg.wTime + mtfScore * cfg.wMTF + momScore * cfg.wMomentum
+
+    string tier = scoreTotal > 80 ? "high" : scoreTotal >= 60 ? "moderate" : "low"
+    string cid = (degree == 2 ? "2-" : "") + "D" + str.tostring(startIdx)
+    float invLevel = e1
+
+    bool anchored = anchoredStart(pP, startIdx, isUp, cfg.anchorLookback)
+    WaveCount.new(cid, ptype, valid, true, isUp, scoreTotal, fibScore, structScoreRaw, eqScore, timeScore, mtfScore,
+         invLevel, tier, ptype, false, 5, s0, e1, e2, e3, e4, e5, b1, array.get(pBr, startIdx + 2),
+         array.get(pBr, startIdx + 3), b4, b5, startIdx, "", degree, b5, anchored, 5, momScore, tInfo)
+
+evaluateZigzagFlatWindowCore(array<float> pP, array<int> pBr, int degree, int startIdx, EngineConfig cfg, float rsiSeries, bool computeMomentum) =>
+    float p0 = array.get(pP, startIdx)
+    float pA = array.get(pP, startIdx + 1)
+    float pB = array.get(pP, startIdx + 2)
+    float pC = array.get(pP, startIdx + 3)
+    int   b0 = array.get(pBr, startIdx)
+    int   bA = array.get(pBr, startIdx + 1)
+    int   bB = array.get(pBr, startIdx + 2)
+    int   bC = array.get(pBr, startIdx + 3)
+
+    bool isUp = pA > p0
+    float lenA = math.abs(pA - p0)
+    float lenB = math.abs(pB - pA)
+    float lenC = math.abs(pC - pB)
+
+    float ratioB = lenA > 0 ? lenB / lenA : 0.0
+    float ratioC = lenA > 0 ? lenC / lenA : 0.0
+
+    string ptype = ratioB <= 0.786 ? "Zigzag" : "Flat"
+
+    bool bRatioHard = ratioB > 0 and ratioB < 1.5
+    float bRatioViol = math.max(0.0, ratioB - 1.5)
+    [bRatioPass, bRatioMalus] = f_softRuleTol(bRatioHard, bRatioViol, cfg.tolCorrectiveBPct, cfg.tolMaxMalus)
+    bool cShort = isUp ? pC <= pA : pC >= pA
+    bool bBeyondStart = isUp ? pB < p0 : pB > p0
+    float cShortPct = lenA > 0 ? math.max(0.0, (isUp ? pA - pC : pC - pA) / lenA * 100.0) : 0.0
+    [cEndPass, cEndMalus] = f_softRuleTol(not cShort or bBeyondStart, cShortPct, cfg.tolCEndPct, cfg.tolMaxMalus)
+    bool valid = bRatioPass and cEndPass and barsStrictlyRising(pBr, startIdx, 3)
+    string tInfo = cShort ? (bBeyondStart ? "TR:3:" : "TC:3:") + str.tostring(cShortPct, "#.#") : ""
+
+    float structScoreRaw = 0.0
+    if ptype == "Zigzag"
+        structScoreRaw := math.max(0.0, 100.0 - math.abs(ratioB - 0.618) * 150.0)
+    else
+        structScoreRaw := math.max(0.0, 100.0 - math.abs(ratioB - 1.0) * 150.0)
+
+    float scoreB = fibConformityScore(ratioB, cfg.retracementLevels)
+    float scoreC = fibConformityScore(ratioC, cfg.extensionLevels)
+    float fibScore = (scoreB + scoreC) / 2.0
+
+    int durA = bA - b0
+    int durC = bC - bB
+    float ratioEqTime = (durA > 0 and durC > 0) ? math.min(durA, durC) / math.max(durA, durC) : 0.0
+    float eqScore = math.max(0.0, 100.0 - math.abs(ratioEqTime - 1.0) * 100.0)
+
+    float ratioT = durA > 0 ? durC / float(durA) : 0.0
+    float timeScore = durA > 0 ? fibConformityScore(ratioT, cfg.timeLevels) : 50.0
+
+    float mtfScore = mtfAlignScore(isUp, cfg.dirD1, cfg.dirH4)
+    float momScore = f_momentumScore(pBr, degree, startIdx, 3, ptype, rsiSeries, cfg.maxBarsBackSafe, computeMomentum)
+
+    float scoreTotal = fibScore * cfg.wFib + structScoreRaw * cfg.wAlt + eqScore * cfg.wEq + timeScore * cfg.wTime + mtfScore * cfg.wMTF + momScore * cfg.wMomentum - bRatioMalus - cEndMalus
+    string tier = scoreTotal > 80 ? "high" : scoreTotal >= 60 ? "moderate" : "low"
+
+    bool possibleCombo = ratioC > 1.618 and ratioB > 0.5 and ratioB < 0.9
+
+    string cid = (degree == 2 ? "2-" : "") + (ptype == "Zigzag" ? "Z" : "F") + str.tostring(startIdx)
+    string dlabel = ptype + (isUp ? " bullish" : " bearish") + " (window " + str.tostring(startIdx) + ")" +
+         (possibleCombo ? " [poss. W-X-Y]" : "")
+    float invLevel = pC
+
+    bool anchored = anchoredStart(pP, startIdx, isUp, cfg.anchorLookback)
+    WaveCount.new(cid, dlabel, valid, false, isUp, scoreTotal, fibScore, structScoreRaw, eqScore, timeScore, mtfScore,
+         invLevel, tier, ptype, possibleCombo, 3, p0, pA, pB, pC, na, na, bA, bB, bC, na, na, startIdx, "", degree, bC, anchored, 3, momScore, tInfo)
+
+evaluateTriangleWindowCore(array<float> pP, array<int> pBr, int degree, int startIdx, EngineConfig cfg, float rsiSeries, bool computeMomentum) =>
+    float p0 = array.get(pP, startIdx)
+    float pA = array.get(pP, startIdx + 1)
+    float pB = array.get(pP, startIdx + 2)
+    float pC = array.get(pP, startIdx + 3)
+    float pD = array.get(pP, startIdx + 4)
+    float pE = array.get(pP, startIdx + 5)
+    int   b0 = array.get(pBr, startIdx)
+    int   bA = array.get(pBr, startIdx + 1)
+    int   bB = array.get(pBr, startIdx + 2)
+    int   bC = array.get(pBr, startIdx + 3)
+    int   bE = array.get(pBr, startIdx + 5)
+    int   bD = array.get(pBr, startIdx + 4)
+
+    bool isUp = pA > p0
+    float lenA = math.abs(pA - p0)
+    float lenB = math.abs(pB - pA)
+    float lenC = math.abs(pC - pB)
+    float lenD = math.abs(pD - pC)
+    float lenE = math.abs(pE - pD)
+    bool convContract = isUp ? (pC < pA and pD > pB and pE < pC) : (pC > pA and pD < pB and pE > pC)
+    bool convExpand   = isUp ? (pC > pA and pD < pB and pE > pC) : (pC < pA and pD > pB and pE < pC)
+    bool contracting = lenC < lenA and lenD < lenB and lenE < lenC and convContract
+    bool expanding = lenC > lenA and lenD > lenB and lenE > lenC and convExpand
+    bool valid = (contracting or expanding) and barsStrictlyRising(pBr, startIdx, 5)
+    string ptype = contracting ? "Triangle (contracting)" : expanding ? "Triangle (expanding)" : "Triangle (irregular)"
+
+    float r1 = lenA > 0 ? lenC / lenA : 1.0
+    float r2 = lenB > 0 ? lenD / lenB : 1.0
+    float r3 = lenC > 0 ? lenE / lenC : 1.0
+    float avgRatio = (r1 + r2 + r3) / 3.0
+    float ratioSpread = math.max(math.abs(r1 - avgRatio), math.max(math.abs(r2 - avgRatio), math.abs(r3 - avgRatio)))
+    float structScoreRaw = math.max(0.0, 100.0 - ratioSpread * 200.0)
+
+    float fibScore = contracting ? fibConformityScore(avgRatio, cfg.contractLevels) : fibConformityScore(avgRatio, cfg.expandLevels)
+
+    int durA = bA - b0
+    int durE = bE - bD
+    float ratioT = durA > 0 ? durE / float(durA) : 0.0
+    float timeScore = durA > 0 ? fibConformityScore(ratioT, cfg.timeLevels) : 50.0
+    float ratioEq = (lenB > 0 and lenD > 0) ? math.min(lenB, lenD) / math.max(lenB, lenD) : 0.0
+    float eqScore = math.max(0.0, 100.0 - math.abs(ratioEq - 1.0) * 100.0)
+    float mtfScore = mtfAlignScore(isUp, cfg.dirD1, cfg.dirH4)
+    float momScore = f_momentumScore(pBr, degree, startIdx, 5, ptype, rsiSeries, cfg.maxBarsBackSafe, computeMomentum)
+    float scoreTotal = fibScore * cfg.wFib + structScoreRaw * cfg.wAlt + eqScore * cfg.wEq + timeScore * cfg.wTime + mtfScore * cfg.wMTF + momScore * cfg.wMomentum
+    string cid = (degree == 2 ? "2-" : "") + "T" + str.tostring(startIdx)
+
+    string tier = scoreTotal > 80 ? "high" : scoreTotal >= 60 ? "moderate" : "low"
+
+    bool anchored = anchoredStart(pP, startIdx, isUp, cfg.anchorLookback)
+    WaveCount.new(cid, ptype, valid, false, isUp, scoreTotal, fibScore, structScoreRaw, eqScore, timeScore, mtfScore,
+         pA, tier, ptype, false, 5, p0, pA, pB, pC, pD, pE, bA, bB, bC, bD, bE, startIdx, "", degree, bE, anchored, 5, momScore, "")
+
+f_buildWXYFromXCore(array<float> pP, array<int> pBr, int degree, int startIdx, EngineConfig cfg, float rsiSeries,
+     bool computeMomentum, WaveCount wComp, float p0, float wc, int bw, bool wIsUp, float wNet,
+     float x, int bx, int xLegs, bool xValid, int yStart) =>
+    int nPiv = array.size(pP)
+    string wType = wComp.patternType
+
+    bool triSpace = yStart + 5 <= nPiv - 1
+    bool yIsTri = false
+    WaveCount yComp = na
+    if triSpace
+        WaveCount yTriTry = evaluateTriangleWindowCore(pP, pBr, degree, yStart, cfg, rsiSeries, false)
+        if yTriTry.hardRulesPassed
+            yComp := yTriTry
+            yIsTri := true
+    if na(yComp)
+        yComp := evaluateZigzagFlatWindowCore(pP, pBr, degree, yStart, cfg, rsiSeries, false)
+
+    string yType = yIsTri ? "Triangle" : yComp.patternType
+    int yLegs = yIsTri ? 5 : 3
+    float yc = yIsTri ? yComp.w5e : yComp.w3e
+    int byE = yIsTri ? yComp.w5eBar : yComp.w3eBar
+    bool yOk = yComp.hardRulesPassed
+
+    bool yIsUp = yc > x
+    bool sameDirection = yIsTri or wIsUp == yIsUp
+    bool oneZigzagMax = not (wType == "Zigzag" and yType == "Zigzag")
+    float totalNet = math.abs(yc - p0)
+    bool netProgress = yIsTri or totalNet > wNet
+
+    bool valid = wComp.hardRulesPassed and yOk and xValid and sameDirection and oneZigzagMax and netProgress
+
+    float fibScore = yIsTri ? wComp.scoreFib : (wComp.scoreFib + yComp.scoreFib) / 2.0
+
+    int yEndIdx = yStart + yLegs
+    float pathLen = 0.0
+    for k = startIdx to yEndIdx - 1
+        pathLen := pathLen + math.abs(array.get(pP, k + 1) - array.get(pP, k))
+    float totalNetForRatio = math.abs(yc - p0)
+    float horizRatio = pathLen > 0 ? totalNetForRatio / pathLen : 1.0
+    float horizScore = math.max(0.0, 100.0 - horizRatio * 150.0)
+    float xRatioForScore = wNet > 0 ? math.abs(x - wc) / wNet : 0.0
+    float xScore = math.max(0.0, 100.0 - math.abs(xRatioForScore - 0.5) * 100.0)
+    float structScore = yIsTri ? (horizScore + xScore + wComp.scoreAlternation) / 3.0 :
+         (horizScore + xScore + wComp.scoreAlternation + yComp.scoreAlternation) / 4.0
+
+    float yNet = math.abs(yc - x)
+    float ratioEq = (wNet > 0 and yNet > 0) ? math.min(wNet, yNet) / math.max(wNet, yNet) : 0.0
+    float eqScore = 50.0 + 50.0 * ratioEq
+
+    int durW = bw - array.get(pBr, startIdx)
+    int durY = byE - bx
+    bool propOk = f_comboProportionOk(durY, f_maxLegDur(pBr, yStart, yLegs), durW, cfg)
+    string tInfo = f_joinExt(f_truncRekey(wComp.extInfo, 1), f_truncRekey(yComp.extInfo, 3))
+    float ratioT = durW > 0 ? durY / float(durW) : 0.0
+    float timeScore = durW > 0 ? fibConformityScore(ratioT, cfg.timeLevels) : 50.0
+
+    float mtfScore = mtfAlignScore(wIsUp, cfg.dirD1, cfg.dirH4)
+    float momScore = f_momentumScore(pBr, degree, startIdx, 3, "Combination (WXY)", rsiSeries, cfg.maxBarsBackSafe, computeMomentum)
+    float scoreTotal = fibScore * cfg.wFib + structScore * cfg.wAlt + eqScore * cfg.wEq + timeScore * cfg.wTime + mtfScore * cfg.wMTF + momScore * cfg.wMomentum
+    string tier = scoreTotal > 80 ? "high" : scoreTotal >= 60 ? "moderate" : "low"
+    string cid = (degree == 2 ? "2-" : "") + "WXY" + str.tostring(startIdx) + (xLegs == 3 ? "x" : "") + (yIsTri ? "t" : "")
+    string ptype = "Combination (WXY)"
+    string comboStruct = "W:" + wType + ":3|X:" + (xLegs == 3 ? "zigzag:3" : "leg:1") + "|Y:" + yType + ":" + str.tostring(yLegs)
+    float invLevel = yc
+    int legsUsed = 3 + xLegs + yLegs
+
+    valid := valid and propOk and barsStrictlyRising(pBr, startIdx, legsUsed)
+    bool anchored = anchoredStart(pP, startIdx, wIsUp, cfg.anchorLookback)
+    WaveCount.new(cid, ptype, valid, false, wIsUp, scoreTotal, fibScore, structScore, eqScore, timeScore, mtfScore,
+         invLevel, tier, ptype, false, 3, p0, wc, x, yc, na, na, bw, bx, byE, na, na, startIdx, comboStruct, degree, byE, anchored, legsUsed, momScore, tInfo)
+
+evaluateComboWXYWindowCore(array<float> pP, array<int> pBr, int degree, int startIdx, EngineConfig cfg, float rsiSeries, bool computeMomentum) =>
+    int nPiv = array.size(pP)
+    float p0 = array.get(pP, startIdx)
+
+    WaveCount wComp = evaluateZigzagFlatWindowCore(pP, pBr, degree, startIdx, cfg, rsiSeries, false)
+    float wc = wComp.w3e
+    int   bw = wComp.w3eBar
+    bool wIsUp = wc > p0
+    float wNet = math.abs(wc - p0)
+
+    float xS = array.get(pP, startIdx + 4)
+    int   bxS = array.get(pBr, startIdx + 4)
+    float xSRatio = wNet > 0 ? math.abs(xS - wc) / wNet : 0.0
+    bool  xSValid = xSRatio > 0.1 and xSRatio < 1.3
+    WaveCount candSingle = f_buildWXYFromXCore(pP, pBr, degree, startIdx, cfg, rsiSeries, computeMomentum, wComp, p0, wc, bw, wIsUp, wNet, xS, bxS, 1, xSValid, startIdx + 4)
+
+    WaveCount candMulti = na
+    if startIdx + 9 <= nPiv - 1
+        WaveCount xComp = evaluateZigzagFlatWindowCore(pP, pBr, degree, startIdx + 3, cfg, rsiSeries, false)
+        if xComp.hardRulesPassed
+            float xM = xComp.w3e
+            int   bxM = xComp.w3eBar
+            float xMRatio = wNet > 0 ? math.abs(xM - wc) / wNet : 0.0
+            bool  xMValid = xMRatio > 0.1 and xMRatio < 1.3
+            candMulti := f_buildWXYFromXCore(pP, pBr, degree, startIdx, cfg, rsiSeries, computeMomentum, wComp, p0, wc, bw, wIsUp, wNet, xM, bxM, 3, xMValid, startIdx + 6)
+
+    WaveCount result = candSingle
+    if not na(candMulti) and candMulti.hardRulesPassed and (not candSingle.hardRulesPassed or candMulti.scoreTotal > candSingle.scoreTotal)
+        result := candMulti
+    result
+
+evaluateComboWXYXZWindowCore(array<float> pP, array<int> pBr, int degree, int startIdx, EngineConfig cfg, float rsiSeries, bool computeMomentum) =>
+    int nPiv = array.size(pP)
+    float p0 = array.get(pP, startIdx)
+
+    WaveCount wComp = evaluateZigzagFlatWindowCore(pP, pBr, degree, startIdx, cfg, rsiSeries, false)
+    string wType = wComp.patternType
+    float wc = wComp.w3e
+    int   bw = wComp.w3eBar
+    bool wIsUp = wc > p0
+    float wNet = math.abs(wc - p0)
+
+    float x1 = array.get(pP, startIdx + 4)
+    int   bx1 = array.get(pBr, startIdx + 4)
+    float x1Retrace = math.abs(x1 - wc)
+    float x1Ratio = wNet > 0 ? x1Retrace / wNet : 0.0
+    bool x1Valid = x1Ratio > 0.1 and x1Ratio < 1.3
+
+    WaveCount yComp = evaluateZigzagFlatWindowCore(pP, pBr, degree, startIdx + 4, cfg, rsiSeries, false)
+    string yType = yComp.patternType
+    float yc = yComp.w3e
+    int byE = yComp.w3eBar
+    bool yOk = yComp.hardRulesPassed
+
+    bool yIsUp = yc > x1
+    float yNet = math.abs(yc - x1)
+
+    float x2 = array.get(pP, startIdx + 8)
+    int bx2 = array.get(pBr, startIdx + 8)
+    float x2Retrace = math.abs(x2 - yc)
+    float x2Ratio = yNet > 0 ? x2Retrace / yNet : 0.0
+    bool x2Valid = x2Ratio > 0.1 and x2Ratio < 1.3
+
+    bool triSpace = startIdx + 13 <= nPiv - 1
+    bool zIsTri = false
+    WaveCount zComp = na
+    if triSpace
+        WaveCount zTriTry = evaluateTriangleWindowCore(pP, pBr, degree, startIdx + 8, cfg, rsiSeries, false)
+        if zTriTry.hardRulesPassed
+            zComp := zTriTry
+            zIsTri := true
+    if na(zComp)
+        zComp := evaluateZigzagFlatWindowCore(pP, pBr, degree, startIdx + 8, cfg, rsiSeries, false)
+
+    string zType = zIsTri ? "Triangle" : zComp.patternType
+    int zLegs = zIsTri ? 5 : 3
+    float zc = zIsTri ? zComp.w5e : zComp.w3e
+    int bzE = zIsTri ? zComp.w5eBar : zComp.w3eBar
+    bool zOk = zComp.hardRulesPassed
+
+    bool zIsUp = zc > x2
+    bool sameDirection = wIsUp == yIsUp and (zIsTri or yIsUp == zIsUp)
+    int zigzagCount = (wType == "Zigzag" ? 1 : 0) + (yType == "Zigzag" ? 1 : 0) + (zType == "Zigzag" ? 1 : 0)
+    bool oneZigzagMax = zigzagCount <= 1
+    float yNetFromP0 = math.abs(yc - p0)
+    float totalNet = math.abs(zc - p0)
+    bool netProgress = yNetFromP0 > wNet and (zIsTri or totalNet > yNetFromP0)
+
+    bool valid = wComp.hardRulesPassed and x1Valid and yOk and x2Valid and zOk and sameDirection and oneZigzagMax and netProgress
+
+    float fibScore = zIsTri ?
+         (wComp.scoreFib + yComp.scoreFib) / 2.0 :
+         (wComp.scoreFib + yComp.scoreFib + zComp.scoreFib) / 3.0
+
+    int zEndIdx = startIdx + 8 + zLegs
+    float pathLen = 0.0
+    for k = startIdx to zEndIdx - 1
+        pathLen := pathLen + math.abs(array.get(pP, k + 1) - array.get(pP, k))
+    float horizRatio = pathLen > 0 ? totalNet / pathLen : 1.0
+    float horizScore = math.max(0.0, 100.0 - horizRatio * 150.0)
+    float x1Score = math.max(0.0, 100.0 - math.abs(x1Ratio - 0.5) * 100.0)
+    float x2Score = math.max(0.0, 100.0 - math.abs(x2Ratio - 0.5) * 100.0)
+    float structScore = zIsTri ?
+         (horizScore + x1Score + x2Score + wComp.scoreAlternation + yComp.scoreAlternation) / 5.0 :
+         (horizScore + x1Score + x2Score + wComp.scoreAlternation + yComp.scoreAlternation + zComp.scoreAlternation) / 6.0
+
+    float zNet = math.abs(zc - x2)
+    array<float> netVals = array.from(wNet, yNet, zNet)
+    float maxNetVal = array.max(netVals)
+    float ratioEq = maxNetVal > 0 ? array.min(netVals) / maxNetVal : 0.0
+    float eqScore = 50.0 + 50.0 * ratioEq
+
+    int durW = bw - array.get(pBr, startIdx)
+    int durZ = bzE - bx2
+    int durY = byE - bx1
+    bool propOk = f_comboProportionOk(durY, f_maxLegDur(pBr, startIdx + 4, 3), durW, cfg) and f_comboProportionOk(durZ, f_maxLegDur(pBr, startIdx + 8, zLegs), durY, cfg)
+    string tInfo = f_joinExt(f_joinExt(f_truncRekey(wComp.extInfo, 1), f_truncRekey(yComp.extInfo, 3)), f_truncRekey(zComp.extInfo, 5))
+    float ratioT = durW > 0 ? durZ / float(durW) : 0.0
+    float timeScore = durW > 0 ? fibConformityScore(ratioT, cfg.timeLevels) : 50.0
+
+    float mtfScore = mtfAlignScore(wIsUp, cfg.dirD1, cfg.dirH4)
+    float momScore = f_momentumScore(pBr, degree, startIdx, 3, "Combination (WXYXZ)", rsiSeries, cfg.maxBarsBackSafe, computeMomentum)
+    float scoreTotal = fibScore * cfg.wFib + structScore * cfg.wAlt + eqScore * cfg.wEq + timeScore * cfg.wTime + mtfScore * cfg.wMTF + momScore * cfg.wMomentum
+    string tier = scoreTotal > 80 ? "high" : scoreTotal >= 60 ? "moderate" : "low"
+    string cid = (degree == 2 ? "2-" : "") + "WXYXZ" + str.tostring(startIdx) + (zIsTri ? "t" : "")
+    string ptype = "Combination (WXYXZ)"
+    string comboStruct = "W:" + wType + ":3|X:leg:1|Y:" + yType + ":3|X:leg:1|Z:" + zType + ":" + str.tostring(zLegs)
+    float invLevel = zc
+    int legsUsed = 8 + zLegs
+
+    valid := valid and propOk and barsStrictlyRising(pBr, startIdx, legsUsed)
+    bool anchored = anchoredStart(pP, startIdx, wIsUp, cfg.anchorLookback)
+    WaveCount.new(cid, ptype, valid, false, wIsUp, scoreTotal, fibScore, structScore, eqScore, timeScore, mtfScore,
+         invLevel, tier, ptype, false, 5, p0, wc, x1, yc, x2, zc, bw, bx1, byE, bx2, bzE, startIdx, comboStruct, degree, bzE, anchored, legsUsed, momScore, tInfo)
+
+validateLeg(array<float> vPrices, array<int> vBars, int barStart, int barEnd, float priceStart, float priceEnd, bool expectMotive, bool coarse, bool enableSubWaveCheck, bool strictLegValidation) =>
+    bool  ok = true
+    float score = 50.0
+    if enableSubWaveCheck or coarse
+        int i0 = subLowerBound(vBars, barStart)
+        int i1 = subLowerBound(vBars, barEnd - 1)
+        int cnt = math.max(0, i1 - i0)
+        bool up = priceEnd > priceStart
+        if expectMotive
+            if cnt == 0
+                ok := not coarse ? false : ok
+                score := coarse ? 20.0 : 5.0
+            else if cnt <= 3
+                score := cnt == 3 ? 70.0 : cnt == 2 ? 50.0 : 25.0
+            else if cnt == 4
+                float s1 = array.get(vPrices, i0)
+                float s2 = array.get(vPrices, i0 + 1)
+                float s3 = array.get(vPrices, i0 + 2)
+                float s4 = array.get(vPrices, i0 + 3)
+                float l1 = math.abs(s1 - priceStart)
+                float l3 = math.abs(s3 - s2)
+                float l5 = math.abs(priceEnd - s4)
+                bool m1 = up ? s2 > priceStart : s2 < priceStart
+                bool m2 = up ? s3 > s1 : s3 < s1
+                bool m3 = up ? s4 > s2 : s4 < s2
+                bool m4 = not (l3 < l1 and l3 < l5)
+                bool noOverlap = up ? s4 > s1 : s4 < s1
+                if m1 and m2 and m3 and m4
+                    score := noOverlap ? 100.0 : 92.0
+                else
+                    score := 25.0
+                    if strictLegValidation
+                        ok := false
+            else
+                int distM = cnt - 4
+                if distM == 1
+                    score := 60.0
+                else if distM == 2
+                    score := 42.0
+        else
+            if cnt <= 1
+                score := cnt == 0 ? 90.0 : 80.0
+            else if cnt == 2
+                float sa = array.get(vPrices, i0)
+                float sb = array.get(vPrices, i0 + 1)
+                float lA = math.abs(sa - priceStart)
+                float rB = lA > 0 ? math.abs(sb - sa) / lA : 0.0
+                score := rB > 0.1 and rB < 1.5 ? 100.0 : 60.0
+            else
+                int distC = cnt - 2
+                if distC == 1
+                    score := 60.0
+                else if distC == 2
+                    score := 42.0
+    [ok, score]
+
+legCompressExact(array<float> srcP, array<int> srcB, int srcStart, int srcEnd, int target) =>
+    array<float> lcP = array.new_float(0)
+    array<int>   lcB = array.new_int(0)
+    if srcEnd >= srcStart and srcStart >= 0 and srcEnd < array.size(srcP)
+        for lcK = srcStart to srcEnd
+            array.push(lcP, array.get(srcP, lcK))
+            array.push(lcB, array.get(srcB, lcK))
+    if target >= 4
+        while array.size(lcP) > target
+            int lcN = array.size(lcP)
+            int lcBestI = -1
+            float lcBestAmp = na
+            for lcI = 1 to lcN - 3
+                float lcAmp = math.abs(array.get(lcP, lcI) - array.get(lcP, lcI + 1))
+                if na(lcBestAmp) or lcAmp < lcBestAmp
+                    lcBestAmp := lcAmp
+                    lcBestI := lcI
+            if lcBestI < 0
+                break
+            bool lcIsHigh = array.get(lcP, lcBestI) > array.get(lcP, lcBestI + 1)
+            bool lcMoreExt = lcIsHigh ? array.get(lcP, lcBestI) > array.get(lcP, lcBestI + 2) : array.get(lcP, lcBestI) < array.get(lcP, lcBestI + 2)
+            int lcRem = (lcMoreExt and lcBestI + 2 < lcN - 1) ? lcBestI + 1 : lcBestI
+            array.remove(lcP, lcRem + 1)
+            array.remove(lcP, lcRem)
+            array.remove(lcB, lcRem + 1)
+            array.remove(lcB, lcRem)
+    [lcP, lcB]
+
+f_skelRuleMask(array<float> kP, array<int> kB, EngineConfig cfg) =>
+    int   mask = 0
+    int   nViol = 0
+    if array.size(kP) >= 6 and array.size(kB) >= 6
+        float q0 = array.get(kP, 0)
+        float q1 = array.get(kP, 1)
+        float q2 = array.get(kP, 2)
+        float q3 = array.get(kP, 3)
+        float q4 = array.get(kP, 4)
+        float q5 = array.get(kP, 5)
+        bool  qUp = q1 > q0
+        float qL1 = math.abs(q1 - q0)
+        float qL3 = math.abs(q3 - q2)
+        float qL5 = math.abs(q5 - q4)
+        float qM15 = math.min(qL1, qL5)
+        bool  x1 = qUp ? (q2 > q0) : (q2 < q0)
+        bool  x2 = not (qL3 < qL1 and qL3 < qL5)
+        bool  x3 = qUp ? (q4 > q1) : (q4 < q1)
+        bool  x4 = qUp ? (q4 > q2) : (q4 < q2)
+        bool  x5 = qUp ? (q3 > q1) : (q3 < q1)
+        float v1 = qL1 > 0 ? math.max(0.0, (qUp ? (q0 - q2) : (q2 - q0)) / qL1 * 100.0) : 100.0
+        float v2 = qM15 > 0 ? math.max(0.0, (qM15 - qL3) / qM15 * 100.0) : 0.0
+        float v3 = qL1 > 0 ? math.max(0.0, (qUp ? (q1 - q4) : (q4 - q1)) / qL1 * 100.0) : 100.0
+        float v5 = qL1 > 0 ? math.max(0.0, (qUp ? (q1 - q3) : (q3 - q1)) / qL1 * 100.0) : 100.0
+        bool  p1 = x1 or (cfg.tolWave2Pct > 0 and v1 <= cfg.tolWave2Pct)
+        bool  p2 = x2 or (cfg.tolWave3Pct > 0 and v2 <= cfg.tolWave3Pct)
+        bool  p3 = x3 or (cfg.tolWave4Pct > 0 and v3 <= cfg.tolWave4Pct)
+        bool  p5 = x5 or (cfg.tolWave3Pct > 0 and v5 <= cfg.tolWave3Pct)
+        bool  p6 = barsStrictlyRising(kB, 0, 5)
+        mask := (p1 ? 0 : 1) + (p2 ? 0 : 2) + (p3 ? 0 : 4) + (x4 ? 0 : 8) + (p5 ? 0 : 16) + (p6 ? 0 : 32)
+        nViol := (p1 ? 0 : 1) + (p2 ? 0 : 1) + (p3 ? 0 : 1) + (x4 ? 0 : 1) + (p5 ? 0 : 1) + (p6 ? 0 : 1)
+    [mask, nViol]
+
+f_skelDiagMask(array<float> kP, array<int> kB) =>
+    int nViol = 6
+    if array.size(kP) >= 6 and array.size(kB) >= 6
+        float q0 = array.get(kP, 0)
+        float q1 = array.get(kP, 1)
+        float q2 = array.get(kP, 2)
+        float q3 = array.get(kP, 3)
+        float q4 = array.get(kP, 4)
+        float q5 = array.get(kP, 5)
+        bool  qUp = q1 > q0
+        float qL1 = math.abs(q1 - q0)
+        float qL3 = math.abs(q3 - q2)
+        float qL5 = math.abs(q5 - q4)
+        bool  d1 = qUp ? (q2 > q0) : (q2 < q0)
+        bool  d2 = not (qL3 < qL1 and qL3 < qL5)
+        bool  d4 = qUp ? (q4 > q2) : (q4 < q2)
+        bool  d5 = qUp ? (q3 > q1) : (q3 < q1)
+        bool  dOv = qUp ? (q4 < q1) : (q4 > q1)
+        bool  dWedge = (qL3 < qL1 and qL5 < qL3) or (qL3 > qL1 and qL5 > qL3)
+        nViol := (d1 ? 0 : 1) + (d2 ? 0 : 1) + (d4 ? 0 : 1) + (d5 ? 0 : 1) + (dOv ? 0 : 1) + (dWedge ? 0 : 1) + (barsStrictlyRising(kB, 0, 5) ? 0 : 1)
+    nViol
+
+legCompressRuleAware(array<float> srcP, array<int> srcB, int srcStart, int srcEnd, EngineConfig cfg) =>
+    array<float> raP = array.new_float(0)
+    array<int>   raB = array.new_int(0)
+    array<float> bestP = array.new_float(0)
+    array<int>   bestB = array.new_int(0)
+    array<float> lvP = array.new_float(0)
+    array<int>   lvB = array.new_int(0)
+    array<float> lwP = array.new_float(0)
+    array<int>   lwB = array.new_int(0)
+    if srcEnd >= srcStart
+        for raK = srcStart to srcEnd
+            array.push(raP, array.get(srcP, raK))
+            array.push(raB, array.get(srcB, raK))
+    while array.size(raP) > 10
+        int raN = array.size(raP)
+        int raBestI = -1
+        float raBestAmp = na
+        for raI = 1 to raN - 3
+            float raAmp = math.abs(array.get(raP, raI) - array.get(raP, raI + 1))
+            if na(raBestAmp) or raAmp < raBestAmp
+                raBestAmp := raAmp
+                raBestI := raI
+        if raBestI < 0
+            break
+        bool raIsHigh = array.get(raP, raBestI) > array.get(raP, raBestI + 1)
+        bool raMoreExt = raIsHigh ? array.get(raP, raBestI) > array.get(raP, raBestI + 2) : array.get(raP, raBestI) < array.get(raP, raBestI + 2)
+        int raRem = (raMoreExt and raBestI + 2 < raN - 1) ? raBestI + 1 : raBestI
+        array.remove(raP, raRem + 1)
+        array.remove(raP, raRem)
+        array.remove(raB, raRem + 1)
+        array.remove(raB, raRem)
+    int raM = array.size(raP)
+    int bestViol = 99
+    float bestL3 = -1.0
+    if raM == 6
+        [m6, n6i] = f_skelRuleMask(raP, raB, cfg)
+        int n6 = math.min(n6i, f_skelDiagMask(raP, raB))
+        bestViol := n6
+        bestL3 := math.abs(array.get(raP, 3) - array.get(raP, 2))
+        for raC = 0 to 5
+            array.push(bestP, array.get(raP, raC))
+            array.push(bestB, array.get(raB, raC))
+    else if raM == 8 or raM == 10
+        for raA = 1 to raM - 3
+            array.clear(lvP)
+            array.clear(lvB)
+            for raC = 0 to raM - 1
+                if raC != raA and raC != raA + 1
+                    array.push(lvP, array.get(raP, raC))
+                    array.push(lvB, array.get(raB, raC))
+            int lvM = array.size(lvP)
+            if lvM == 6
+                [mA, nAi] = f_skelRuleMask(lvP, lvB, cfg)
+                int nA = math.min(nAi, f_skelDiagMask(lvP, lvB))
+                float lA = math.abs(array.get(lvP, 3) - array.get(lvP, 2))
+                if nA < bestViol or (nA == bestViol and lA > bestL3)
+                    bestViol := nA
+                    bestL3 := lA
+                    array.clear(bestP)
+                    array.clear(bestB)
+                    for raC = 0 to 5
+                        array.push(bestP, array.get(lvP, raC))
+                        array.push(bestB, array.get(lvB, raC))
+            else if lvM == 8
+                for raD = 1 to lvM - 3
+                    array.clear(lwP)
+                    array.clear(lwB)
+                    for raC = 0 to lvM - 1
+                        if raC != raD and raC != raD + 1
+                            array.push(lwP, array.get(lvP, raC))
+                            array.push(lwB, array.get(lvB, raC))
+                    if array.size(lwP) == 6
+                        [mB, nBi] = f_skelRuleMask(lwP, lwB, cfg)
+                        int nB = math.min(nBi, f_skelDiagMask(lwP, lwB))
+                        float lB = math.abs(array.get(lwP, 3) - array.get(lwP, 2))
+                        if nB < bestViol or (nB == bestViol and lB > bestL3)
+                            bestViol := nB
+                            bestL3 := lB
+                            array.clear(bestP)
+                            array.clear(bestB)
+                            for raC = 0 to 5
+                                array.push(bestP, array.get(lwP, raC))
+                                array.push(bestB, array.get(lwB, raC))
+    [bestP, bestB]
+
+f_fiveOnSkeleton(array<float> kP, array<int> kB, int degree, EngineConfig cfg, float rsiSeries) =>
+    bool  fOk    = false
+    float fScore = na
+    bool  fIsDg  = false
+    if array.size(kP) == 6 and array.size(kB) == 6
+        WaveCount fImp = evaluateImpulseWindowCore(kP, kB, degree, 0, cfg, rsiSeries, false)
+        if fImp.hardRulesPassed
+            fOk    := true
+            fScore := fImp.scoreTotal
+        else
+            WaveCount fDg = evaluateDiagonalWindowCore(kP, kB, degree, 0, cfg, rsiSeries, false)
+            if fDg.hardRulesPassed
+                fOk    := true
+                fScore := fDg.scoreTotal
+                fIsDg  := true
+    [fOk, fScore, fIsDg]
+
+f_check9WaveBlock(array<float> rP, array<int> rB, int degree, EngineConfig cfg, float rsiSeries) =>
+    bool  found = false
+    float bestScore = 0.0
+    int   extPos = 0
+    array<int> pWave  = array.from(3, 5, 1)
+    array<int> pStart = array.from(2, 4, 0)
+    array<int> pEnd   = array.from(7, 9, 5)
+    array<int> oA0    = array.from(0, 0, 6)
+    array<int> oA1    = array.from(1, 1, 7)
+    array<int> oB0    = array.from(8, 2, 8)
+    array<int> oB1    = array.from(9, 3, 9)
+    for t = 0 to 2
+        if not found
+            float legA = math.abs(array.get(rP, array.get(oA1, t)) - array.get(rP, array.get(oA0, t)))
+            float legB = math.abs(array.get(rP, array.get(oB1, t)) - array.get(rP, array.get(oB0, t)))
+            float blockLen = math.abs(array.get(rP, array.get(pEnd, t)) - array.get(rP, array.get(pStart, t)))
+            if legA > 0 and legB > 0 and blockLen > legA * 1.5 and blockLen > legB * 1.5
+                array<float> bp = array.new_float(0)
+                array<int>   bb = array.new_int(0)
+                for k = array.get(pStart, t) to array.get(pEnd, t)
+                    array.push(bp, array.get(rP, k))
+                    array.push(bb, array.get(rB, k))
+                WaveCount blk = evaluateImpulseWindowCore(bp, bb, degree, 0, cfg, rsiSeries, false)
+                if blk.hardRulesPassed
+                    found := true
+                    bestScore := blk.scoreTotal
+                    extPos := array.get(pWave, t)
+    [found, bestScore, extPos]
+
+f_check13WaveBlock(array<float> rP, array<int> rB, int degree, EngineConfig cfg, float rsiSeries) =>
+    bool  found = false
+    float bestScore = 0.0
+    int   extPos = 0
+    array<int> qWave  = array.from(3, 5, 1)
+    array<int> qStart = array.from(2, 4, 0)
+    array<int> qEnd   = array.from(11, 13, 9)
+    array<int> qA0    = array.from(0, 0, 10)
+    array<int> qA1    = array.from(1, 1, 11)
+    array<int> qB0    = array.from(12, 2, 12)
+    array<int> qB1    = array.from(13, 3, 13)
+    for t = 0 to 2
+        if not found
+            float legA = math.abs(array.get(rP, array.get(qA1, t)) - array.get(rP, array.get(qA0, t)))
+            float legB = math.abs(array.get(rP, array.get(qB1, t)) - array.get(rP, array.get(qB0, t)))
+            float blockLen = math.abs(array.get(rP, array.get(qEnd, t)) - array.get(rP, array.get(qStart, t)))
+            if legA > 0 and legB > 0 and blockLen > legA * 1.5 and blockLen > legB * 1.5
+                array<float> bq = array.new_float(0)
+                array<int>   bqB = array.new_int(0)
+                for k = array.get(qStart, t) to array.get(qEnd, t)
+                    array.push(bq, array.get(rP, k))
+                    array.push(bqB, array.get(rB, k))
+                [blkFound, blkScore, blkPos] = f_check9WaveBlock(bq, bqB, degree, cfg, rsiSeries)
+                if blkFound
+                    found := true
+                    bestScore := blkScore
+                    extPos := array.get(qWave, t)
+    [found, bestScore, extPos]
+
+f_check17WaveBlock(array<float> rP, array<int> rB, int degree, EngineConfig cfg, float rsiSeries) =>
+    bool  found = false
+    float bestScore = 0.0
+    int   extPos = 0
+    array<int> sWave  = array.from(3, 5, 1)
+    array<int> sStart = array.from(2, 4, 0)
+    array<int> sEnd   = array.from(15, 17, 13)
+    array<int> sA0    = array.from(0, 0, 14)
+    array<int> sA1    = array.from(1, 1, 15)
+    array<int> sB0    = array.from(16, 2, 16)
+    array<int> sB1    = array.from(17, 3, 17)
+    for t = 0 to 2
+        if not found
+            float legA = math.abs(array.get(rP, array.get(sA1, t)) - array.get(rP, array.get(sA0, t)))
+            float legB = math.abs(array.get(rP, array.get(sB1, t)) - array.get(rP, array.get(sB0, t)))
+            float blockLen = math.abs(array.get(rP, array.get(sEnd, t)) - array.get(rP, array.get(sStart, t)))
+            if legA > 0 and legB > 0 and blockLen > legA * 1.5 and blockLen > legB * 1.5
+                array<float> bs = array.new_float(0)
+                array<int>   bsB = array.new_int(0)
+                for k = array.get(sStart, t) to array.get(sEnd, t)
+                    array.push(bs, array.get(rP, k))
+                    array.push(bsB, array.get(rB, k))
+                [blkFound, blkScore, blkPos] = f_check13WaveBlock(bs, bsB, degree, cfg, rsiSeries)
+                if blkFound
+                    found := true
+                    bestScore := blkScore
+                    extPos := array.get(sWave, t)
+    [found, bestScore, extPos]
+
+f_realLegCheck(array<float> vPrices, array<int> vBars, int barStart, int barEnd, float priceStart, float priceEnd, bool expectMotive, int degree, EngineConfig cfg, float rsiSeries) =>
+    int   extStage = 0
+    int   extSub   = 0
+    int   branchHit = 0
+    bool  ok = true
+    float score = 50.0
+    int i0 = subLowerBound(vBars, barStart)
+    int i1 = subLowerBound(vBars, barEnd - 1)
+    int cnt = math.max(0, i1 - i0)
+    array<float> rP = array.new_float(0)
+    array<int>   rB = array.new_int(0)
+    array.push(rP, priceStart)
+    array.push(rB, barStart)
+    if cnt > 0
+        for k = 0 to cnt - 1
+            array.push(rP, array.get(vPrices, i0 + k))
+            array.push(rB, array.get(vBars, i0 + k))
+    array.push(rP, priceEnd)
+    array.push(rB, barEnd)
+    if expectMotive and cnt == 4
+        branchHit := 1
+        WaveCount impSub = evaluateImpulseWindowCore(rP, rB, degree, 0, cfg, rsiSeries, false)
+        if impSub.hardRulesPassed
+            ok := true
+            score := impSub.scoreTotal
+        else
+            WaveCount diagSub = evaluateDiagonalWindowCore(rP, rB, degree, 0, cfg, rsiSeries, false)
+            ok := diagSub.hardRulesPassed
+            score := diagSub.hardRulesPassed ? diagSub.scoreTotal : 25.0
+    else if expectMotive and cnt == 8
+        branchHit := 2
+        if cfg.enableExtensionFamily
+            [ext9Found, ext9Score, ext9Pos] = f_check9WaveBlock(rP, rB, degree, cfg, rsiSeries)
+            score := ext9Found ? ext9Score : 50.0
+            if ext9Found
+                extStage := 9
+                extSub   := ext9Pos
+    else if expectMotive and cnt == 12
+        branchHit := 3
+        if cfg.enableExtensionFamily
+            [ext13Found, ext13Score, ext13Pos] = f_check13WaveBlock(rP, rB, degree, cfg, rsiSeries)
+            score := ext13Found ? ext13Score : 50.0
+            if ext13Found
+                extStage := 13
+                extSub   := ext13Pos
+    else if expectMotive and cnt == 16
+        branchHit := 4
+        if cfg.enableExtensionFamily
+            [ext17Found, ext17Score, ext17Pos] = f_check17WaveBlock(rP, rB, degree, cfg, rsiSeries)
+            score := ext17Found ? ext17Score : 50.0
+            if ext17Found
+                extStage := 17
+                extSub   := ext17Pos
+    else if not expectMotive and cnt == 2
+        branchHit := 5
+        WaveCount zfSub = evaluateZigzagFlatWindowCore(rP, rB, degree, 0, cfg, rsiSeries, false)
+        ok := zfSub.hardRulesPassed
+        score := zfSub.hardRulesPassed ? zfSub.scoreTotal : 60.0
+    else if not expectMotive and cnt == 4
+        branchHit := 6
+        WaveCount triSub = evaluateTriangleWindowCore(rP, rB, degree, 0, cfg, rsiSeries, false)
+        ok := triSub.hardRulesPassed
+        score := triSub.hardRulesPassed ? triSub.scoreTotal : 25.0
+    else if not expectMotive and (cnt == 6 or cnt == 8)
+        branchHit := 7
+        WaveCount wxySub = evaluateComboWXYWindowCore(rP, rB, degree, 0, cfg, rsiSeries, false)
+        ok := wxySub.hardRulesPassed and wxySub.legsConsumed == cnt + 2
+        score := ok ? wxySub.scoreTotal : 25.0
+    else if not expectMotive and (cnt == 10 or cnt == 12)
+        branchHit := 8
+        WaveCount wxyxzSub = evaluateComboWXYXZWindowCore(rP, rB, degree, 0, cfg, rsiSeries, false)
+        ok := wxyxzSub.hardRulesPassed and wxyxzSub.legsConsumed == cnt + 2
+        score := ok ? wxyxzSub.scoreTotal : 25.0
+    else
+        int cN = array.size(rP)
+        array<float> cP = array.new_float(0)
+        array<int>   cB = array.new_int(0)
+        if cN > 0
+            for k = 0 to cN - 1
+                array.push(cP, array.get(rP, k))
+                array.push(cB, array.get(rB, k))
+        if cN % 2 == 1 and cN >= 3
+            int dropIdx = -1
+            for k = 1 to cN - 2
+                if dropIdx < 0
+                    bool upA = array.get(cP, k) > array.get(cP, k - 1)
+                    bool upB = array.get(cP, k + 1) > array.get(cP, k)
+                    if upA == upB
+                        dropIdx := k
+            array.remove(cP, dropIdx < 0 ? 1 : dropIdx)
+            array.remove(cB, dropIdx < 0 ? 1 : dropIdx)
+        int cM = array.size(cP)
+        int frMask = 0
+        if expectMotive
+            if cM >= 6
+                array<float> raP = array.new_float(0)
+                array<int>   raB = array.new_int(0)
+                if cfg.ruleAwareCompress
+                    [raSelP, raSelB] = legCompressRuleAware(cP, cB, 0, cM - 1, cfg)
+                    if array.size(raSelP) == 6
+                        raP := raSelP
+                        raB := raSelB
+                array<float> exP = array.new_float(0)
+                array<int>   exB = array.new_int(0)
+                [exFallP, exFallB] = legCompressExact(cP, cB, 0, cM - 1, 6)
+                if array.size(exFallP) == 6
+                    exP := exFallP
+                    exB := exFallB
+                [aOk, aSc, aDg] = f_fiveOnSkeleton(raP, raB, degree, cfg, rsiSeries)
+                [bOk, bSc, bDg] = f_fiveOnSkeleton(exP, exB, degree, cfg, rsiSeries)
+                bool useA = aOk and (not bOk or aSc >= bSc)
+                if aOk or bOk
+                    ok := true
+                    score := useA ? aSc : bSc
+                    branchHit := (useA ? aDg : bDg) ? 11 : 1
+                array<float> c5P = array.size(raP) == 6 ? raP : exP
+                array<int>   c5B = array.size(raB) == 6 ? raB : exB
+                if branchHit != 1 and branchHit != 11 and array.size(c5P) == 6
+                    [dgMask, dgN] = f_skelRuleMask(c5P, c5B, cfg)
+                    frMask := dgMask
+            float fiveScore = (branchHit == 1 or branchHit == 11) ? score : na
+            if cfg.enableExtensionFamily
+                if extStage == 0 and cM >= 18 and cnt >= cfg.extMinRawPerWave * 17
+                    [c17P, c17B] = legCompressExact(cP, cB, 0, cM - 1, 18)
+                    if array.size(c17P) == 18
+                        [f17, s17, p17] = f_check17WaveBlock(c17P, c17B, degree, cfg, rsiSeries)
+                        if f17 and (na(fiveScore) or s17 > fiveScore + cfg.extScoreMargin)
+                            extStage := 17
+                            extSub   := p17
+                            score    := s17
+                            branchHit := 4
+                if extStage == 0 and cM >= 14 and cnt >= cfg.extMinRawPerWave * 13
+                    [c13P, c13B] = legCompressExact(cP, cB, 0, cM - 1, 14)
+                    if array.size(c13P) == 14
+                        [f13, s13, p13] = f_check13WaveBlock(c13P, c13B, degree, cfg, rsiSeries)
+                        if f13 and (na(fiveScore) or s13 > fiveScore + cfg.extScoreMargin)
+                            extStage := 13
+                            extSub   := p13
+                            score    := s13
+                            branchHit := 3
+                if extStage == 0 and cM >= 10 and cnt >= cfg.extMinRawPerWave * 9
+                    [c9P, c9B] = legCompressExact(cP, cB, 0, cM - 1, 10)
+                    if array.size(c9P) == 10
+                        [f9, s9, p9] = f_check9WaveBlock(c9P, c9B, degree, cfg, rsiSeries)
+                        if f9 and (na(fiveScore) or s9 > fiveScore + cfg.extScoreMargin)
+                            extStage := 9
+                            extSub   := p9
+                            score    := s9
+                            branchHit := 2
+        else
+            if cM >= 4
+                [c3P, c3B] = legCompressExact(cP, cB, 0, cM - 1, 4)
+                if array.size(c3P) == 4
+                    WaveCount cZf = evaluateZigzagFlatWindowCore(c3P, c3B, degree, 0, cfg, rsiSeries, false)
+                    if cZf.hardRulesPassed
+                        int zcB = array.get(c3B, 2)
+                        int zcFrom = -1
+                        for zk = 0 to cM - 1
+                            if zcFrom < 0 and array.get(cB, zk) >= zcB
+                                zcFrom := zk
+                        bool zcVerdictBlocked = false
+                        if zcFrom >= 0 and (cM - zcFrom) % 2 == 1
+                            zcFrom := zcFrom + 1
+                        if zcFrom >= 0 and cM - zcFrom >= 6
+                            [zcP6, zcB6] = legCompressExact(cP, cB, zcFrom, cM - 1, 6)
+                            if array.size(zcP6) == 6
+                                [zcM, zcNi] = f_skelRuleMask(zcP6, zcB6, cfg)
+                                int zcN = math.min(zcNi, f_skelDiagMask(zcP6, zcB6))
+                                zcVerdictBlocked := zcN > 0
+                        if not zcVerdictBlocked
+                            ok := true
+                            score := cZf.scoreTotal
+                            branchHit := 5
+            if branchHit == 0 and cM >= 6
+                [cTP, cTB] = legCompressExact(cP, cB, 0, cM - 1, 6)
+                if array.size(cTP) == 6
+                    WaveCount cTri = evaluateTriangleWindowCore(cTP, cTB, degree, 0, cfg, rsiSeries, false)
+                    if cTri.hardRulesPassed
+                        ok := true
+                        score := cTri.scoreTotal
+                        branchHit := 6
+        if branchHit == 0 and (expectMotive ? cM >= 6 : cM >= 4)
+            branchHit := frMask > 0 ? -(1000 + frMask) : -1
+        if cnt == 0
+            score := 20.0
+        else
+            int distTarget = expectMotive ? math.abs(cnt - 4) :
+                 math.min(math.abs(cnt - 2), math.min(math.abs(cnt - 4), math.min(math.abs(cnt - 6),
+                 math.min(math.abs(cnt - 8), math.min(math.abs(cnt - 10), math.abs(cnt - 12))))))
+            if distTarget == 1
+                score := 60.0
+            else if distTarget == 2
+                score := 42.0
+    [ok, score, extStage, extSub, cnt, branchHit]
+
+export evaluateImpulseWindow(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int startIdx, EngineConfig cfg, float rsiSeries) =>
+    WaveCount wc = evaluateImpulseWindowCore(pP, pBr, degree, startIdx, cfg, rsiSeries, true)
+    float s0 = array.get(pP, startIdx)
+    int   b0 = array.get(pBr, startIdx)
+    float e1 = wc.w1e
+    float e2 = wc.w2e
+    float e3 = wc.w3e
+    float e4 = wc.w4e
+    float e5 = wc.w5e
+    int   b1 = wc.w1eBar
+    int   b2 = wc.w2eBar
+    int   b3 = wc.w3eBar
+    int   b4 = wc.w4eBar
+    int   b5 = wc.w5eBar
+
+    [sub1Ok, sub1Sc] = validateLeg(vP, vB, b0, b1, s0, e1, true, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [sub2Ok, sub2Sc] = validateLeg(vP, vB, b1, b2, e1, e2, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [sub3Ok, sub3Sc] = validateLeg(vP, vB, b2, b3, e2, e3, true, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [sub4Ok, sub4Sc] = validateLeg(vP, vB, b3, b4, e3, e4, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [sub5Ok, sub5Sc] = validateLeg(vP, vB, b4, b5, e4, e5, true, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+
+    float altScoreRaw = wc.scoreAlternation
+    float subScore = (sub1Sc + sub2Sc + sub3Sc + sub4Sc + sub5Sc) / 5.0
+    float altScoreFinal = (cfg.enableSubWaveCheck or degree > 1) ? (altScoreRaw + subScore) / 2.0 : altScoreRaw
+
+    bool validFinal = wc.hardRulesPassed and sub1Ok and sub3Ok and sub5Ok
+    float scoreTotalFinal = math.max(0.0, wc.scoreTotal + (altScoreFinal - altScoreRaw) * cfg.wAlt)
+    string tierFinal = scoreTotalFinal > 80 ? "high" : scoreTotalFinal >= 60 ? "moderate" : "low"
+
+    wc.hardRulesPassed := validFinal
+    wc.scoreAlternation := altScoreFinal
+    wc.scoreTotal := scoreTotalFinal
+    wc.confidenceTier := tierFinal
+    wc
+
+export evaluateImpulseRecoveredWindow(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int startIdx, EngineConfig cfg, float rsiSeries) =>
+    float rp0 = array.get(pP, startIdx)
+    float rp1 = array.get(pP, startIdx + 1)
+    float rp2 = array.get(pP, startIdx + 2)
+    float rp3 = array.get(pP, startIdx + 3)
+    int   rb0 = array.get(pBr, startIdx)
+    int   rb1 = array.get(pBr, startIdx + 1)
+    int   rb2 = array.get(pBr, startIdx + 2)
+    int   rb3 = array.get(pBr, startIdx + 3)
+    bool rDirUp = rp1 > rp0
+    float rLenA = math.abs(rp1 - rp0)
+    float rLenC = math.abs(rp3 - rp2)
+    bool rMergedLast = rLenC >= rLenA
+    int rLegSBar = rMergedLast ? rb2 : rb0
+    int rLegEBar = rMergedLast ? rb3 : rb1
+    int rScanS = subLowerBound(vB, rLegSBar)
+    int rScanE = subLowerBound(vB, rLegEBar - 1)
+    float rRecH = na
+    int   rRecHBar = na
+    float rRecL = na
+    int   rRecLBar = na
+    if rScanE - rScanS >= 2
+        float rRun = array.get(vP, rScanS)
+        int   rRunBar = array.get(vB, rScanS)
+        float rBestPull = 0.0
+        for rK = rScanS + 1 to rScanE - 1
+            float rV = array.get(vP, rK)
+            if rDirUp
+                if rV > rRun
+                    rRun := rV
+                    rRunBar := array.get(vB, rK)
+                else if rRun - rV > rBestPull
+                    rBestPull := rRun - rV
+                    rRecH := rRun
+                    rRecHBar := rRunBar
+                    rRecL := rV
+                    rRecLBar := array.get(vB, rK)
+            else
+                if rV < rRun
+                    rRun := rV
+                    rRunBar := array.get(vB, rK)
+                else if rV - rRun > rBestPull
+                    rBestPull := rV - rRun
+                    rRecL := rRun
+                    rRecLBar := rRunBar
+                    rRecH := rV
+                    rRecHBar := array.get(vB, rK)
+    WaveCount rwc = WaveCount.new("RI-none", "recovered impulse (no interior pair found)", false, false, rDirUp,
+         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, na, "low", "Impulse", false, 5,
+         rp0, na, na, na, na, na, na, na, na, na, na, startIdx, "", degree, rb3, false, 3, 0.0, "")
+    if not na(rRecH) and not na(rRecL)
+        float rIns1 = rDirUp ? rRecH : rRecL
+        float rIns2 = rDirUp ? rRecL : rRecH
+        int   rIns1Bar = rDirUp ? rRecHBar : rRecLBar
+        int   rIns2Bar = rDirUp ? rRecLBar : rRecHBar
+        array<float> rTmpP = rMergedLast ?
+             array.from(rp0, rp1, rp2, rIns1, rIns2, rp3) :
+             array.from(rp0, rIns1, rIns2, rp1, rp2, rp3)
+        array<int> rTmpB = rMergedLast ?
+             array.from(rb0, rb1, rb2, rIns1Bar, rIns2Bar, rb3) :
+             array.from(rb0, rIns1Bar, rIns2Bar, rb1, rb2, rb3)
+        WaveCount rEval = evaluateImpulseWindow(rTmpP, rTmpB, vP, vB, degree, 0, cfg, rsiSeries)
+        if rEval.hardRulesPassed
+            rEval.countId := (degree == 2 ? "2-" : "") + "RI" + str.tostring(startIdx)
+            rEval.degreeLabel := (rDirUp ? "Impulse bullish" : "Impulse bearish") + " (recovered, window " + str.tostring(startIdx) + ")"
+            rEval.startIdx := startIdx
+            rEval.legsConsumed := 3
+            rEval.anchoredStart := anchoredStart(pP, startIdx, rDirUp, cfg.anchorLookback)
+            rwc := rEval
+    rwc
+
+export evaluateDiagonalWindow(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int startIdx, EngineConfig cfg, float rsiSeries) =>
+    WaveCount wc = evaluateDiagonalWindowCore(pP, pBr, degree, startIdx, cfg, rsiSeries, true)
+    float s0 = array.get(pP, startIdx)
+    int   b0 = array.get(pBr, startIdx)
+    float e1 = wc.w1e
+    float e2 = wc.w2e
+    float e3 = wc.w3e
+    float e4 = wc.w4e
+    float e5 = wc.w5e
+    int   b1 = wc.w1eBar
+    int   b2 = wc.w2eBar
+    int   b3 = wc.w3eBar
+    int   b4 = wc.w4eBar
+    int   b5 = wc.w5eBar
+
+    [d1okA, d1scA] = validateLeg(vP, vB, b0, b1, s0, e1, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [d2okA, d2scA] = validateLeg(vP, vB, b1, b2, e1, e2, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [d3okA, d3scA] = validateLeg(vP, vB, b2, b3, e2, e3, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [d4okA, d4scA] = validateLeg(vP, vB, b3, b4, e3, e4, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [d5okA, d5scA] = validateLeg(vP, vB, b4, b5, e4, e5, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    float subScoreAll3 = (d1scA + d2scA + d3scA + d4scA + d5scA) / 5.0
+    float subScore = subScoreAll3
+    bool isLeading = str.contains(wc.patternType, "Leading")
+    if isLeading
+        [d1okM, d1scM] = validateLeg(vP, vB, b0, b1, s0, e1, true, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+        [d3okM, d3scM] = validateLeg(vP, vB, b2, b3, e2, e3, true, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+        [d5okM, d5scM] = validateLeg(vP, vB, b4, b5, e4, e5, true, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+        float subScore53535 = (d1scM + d2scA + d3scM + d4scA + d5scM) / 5.0
+        subScore := math.max(subScoreAll3, subScore53535)
+
+    float structRaw = wc.scoreAlternation
+    float structFinal = (cfg.enableSubWaveCheck or degree > 1) ? (structRaw + subScore) / 2.0 : structRaw
+    float scoreTotalFinal = wc.scoreTotal + (structFinal - structRaw) * cfg.wAlt
+    string tierFinal = scoreTotalFinal > 80 ? "high" : scoreTotalFinal >= 60 ? "moderate" : "low"
+
+    wc.scoreAlternation := structFinal
+    wc.scoreTotal := scoreTotalFinal
+    wc.confidenceTier := tierFinal
+    wc
+
+export evaluateZigzagFlatWindow(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int startIdx, EngineConfig cfg, float rsiSeries) =>
+    WaveCount wc = evaluateZigzagFlatWindowCore(pP, pBr, degree, startIdx, cfg, rsiSeries, true)
+    float p0 = wc.w1s
+    float pA = wc.w1e
+    float pB = wc.w2e
+    float pC = wc.w3e
+    int   b0 = array.get(pBr, startIdx)
+    int   bA = wc.w1eBar
+    int   bB = wc.w2eBar
+    int   bC = wc.w3eBar
+
+    bool aExpectMotive = wc.patternType == "Zigzag"
+    [subAOk, subASc] = validateLeg(vP, vB, b0, bA, p0, pA, aExpectMotive, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [subBOk, subBSc] = validateLeg(vP, vB, bA, bB, pA, pB, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [subCOk, subCSc] = validateLeg(vP, vB, bB, bC, pB, pC, true, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+
+    float structRaw = wc.scoreAlternation
+    float subScore = (subASc + subBSc + subCSc) / 3.0
+    float structFinal = (cfg.enableSubWaveCheck or degree > 1) ? (structRaw + subScore) / 2.0 : structRaw
+
+    bool validFinal = wc.hardRulesPassed and subAOk and subCOk
+    float scoreTotalFinal = math.max(0.0, wc.scoreTotal + (structFinal - structRaw) * cfg.wAlt)
+    string tierFinal = scoreTotalFinal > 80 ? "high" : scoreTotalFinal >= 60 ? "moderate" : "low"
+
+    wc.hardRulesPassed := validFinal
+    wc.scoreAlternation := structFinal
+    wc.scoreTotal := scoreTotalFinal
+    wc.confidenceTier := tierFinal
+    wc
+
+export evaluateTriangleWindow(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int startIdx, EngineConfig cfg, float rsiSeries) =>
+    WaveCount wc = evaluateTriangleWindowCore(pP, pBr, degree, startIdx, cfg, rsiSeries, true)
+    float p0 = wc.w1s
+    float pA = wc.w1e
+    float pB = wc.w2e
+    float pC = wc.w3e
+    float pD = wc.w4e
+    float pE = wc.w5e
+    int   b0 = array.get(pBr, startIdx)
+    int   bA = wc.w1eBar
+    int   bB = wc.w2eBar
+    int   bC = wc.w3eBar
+    int   bD = wc.w4eBar
+    int   bE = wc.w5eBar
+
+    [tAok, tASc] = validateLeg(vP, vB, b0, bA, p0, pA, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [tBok, tBSc] = validateLeg(vP, vB, bA, bB, pA, pB, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [tCok, tCSc] = validateLeg(vP, vB, bB, bC, pB, pC, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [tDok, tDSc] = validateLeg(vP, vB, bC, bD, pC, pD, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    [tEok, tESc] = validateLeg(vP, vB, bD, bE, pD, pE, false, degree > 1, cfg.enableSubWaveCheck, cfg.strictLegValidation)
+    float subScore = (tASc + tBSc + tCSc + tDSc + tESc) / 5.0
+
+    float structRaw = wc.scoreAlternation
+    float structFinal = (cfg.enableSubWaveCheck or degree > 1) ? (structRaw + subScore) / 2.0 : structRaw
+    float scoreTotalFinal = wc.scoreTotal + (structFinal - structRaw) * cfg.wAlt
+    string tierFinal = scoreTotalFinal > 80 ? "high" : scoreTotalFinal >= 60 ? "moderate" : "low"
+
+    wc.scoreAlternation := structFinal
+    wc.scoreTotal := scoreTotalFinal
+    wc.confidenceTier := tierFinal
+    wc
+
+f_buildWXYFromX(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int startIdx, EngineConfig cfg, float rsiSeries,
+     WaveCount wComp, float p0, float wc, int bw, bool wIsUp, float wNet,
+     float x, int bx, int xLegs, bool xValid, int yStart) =>
+    int nPiv = array.size(pP)
+    string wType = wComp.patternType
+
+    bool triSpace = yStart + 5 <= nPiv - 1
+    bool yIsTri = false
+    WaveCount yComp = na
+    if triSpace
+        WaveCount yTriTry = evaluateTriangleWindow(pP, pBr, vP, vB, degree, yStart, cfg, rsiSeries)
+        if yTriTry.hardRulesPassed
+            yComp := yTriTry
+            yIsTri := true
+    if na(yComp)
+        yComp := evaluateZigzagFlatWindow(pP, pBr, vP, vB, degree, yStart, cfg, rsiSeries)
+
+    string yType = yIsTri ? "Triangle" : yComp.patternType
+    int yLegs = yIsTri ? 5 : 3
+    float yc = yIsTri ? yComp.w5e : yComp.w3e
+    int byE = yIsTri ? yComp.w5eBar : yComp.w3eBar
+    bool yOk = yComp.hardRulesPassed
+
+    bool yIsUp = yc > x
+    bool sameDirection = yIsTri or wIsUp == yIsUp
+    bool oneZigzagMax = not (wType == "Zigzag" and yType == "Zigzag")
+    float totalNet = math.abs(yc - p0)
+    bool netProgress = yIsTri or totalNet > wNet
+
+    bool valid = wComp.hardRulesPassed and yOk and xValid and sameDirection and oneZigzagMax and netProgress
+
+    float fibScore = yIsTri ? wComp.scoreFib : (wComp.scoreFib + yComp.scoreFib) / 2.0
+
+    int yEndIdx = yStart + yLegs
+    float pathLen = 0.0
+    for k = startIdx to yEndIdx - 1
+        pathLen := pathLen + math.abs(array.get(pP, k + 1) - array.get(pP, k))
+    float totalNetForRatio = math.abs(yc - p0)
+    float horizRatio = pathLen > 0 ? totalNetForRatio / pathLen : 1.0
+    float horizScore = math.max(0.0, 100.0 - horizRatio * 150.0)
+    float xRatioForScore = wNet > 0 ? math.abs(x - wc) / wNet : 0.0
+    float xScore = math.max(0.0, 100.0 - math.abs(xRatioForScore - 0.5) * 100.0)
+    float structScore = yIsTri ? (horizScore + xScore + wComp.scoreAlternation) / 3.0 :
+         (horizScore + xScore + wComp.scoreAlternation + yComp.scoreAlternation) / 4.0
+
+    float yNet = math.abs(yc - x)
+    float ratioEq = (wNet > 0 and yNet > 0) ? math.min(wNet, yNet) / math.max(wNet, yNet) : 0.0
+    float eqScore = 50.0 + 50.0 * ratioEq
+
+    int durW = bw - array.get(pBr, startIdx)
+    int durY = byE - bx
+    bool propOk = f_comboProportionOk(durY, f_maxLegDur(pBr, yStart, yLegs), durW, cfg)
+    string tInfo = f_joinExt(f_truncRekey(wComp.extInfo, 1), f_truncRekey(yComp.extInfo, 3))
+    float ratioT = durW > 0 ? durY / float(durW) : 0.0
+    float timeScore = durW > 0 ? fibConformityScore(ratioT, cfg.timeLevels) : 50.0
+
+    float mtfScore = mtfAlignScore(wIsUp, cfg.dirD1, cfg.dirH4)
+    float momScore = f_momentumScore(pBr, degree, startIdx, 3, "Combination (WXY)", rsiSeries, cfg.maxBarsBackSafe, true)
+    float scoreTotal = fibScore * cfg.wFib + structScore * cfg.wAlt + eqScore * cfg.wEq + timeScore * cfg.wTime + mtfScore * cfg.wMTF + momScore * cfg.wMomentum
+    string tier = scoreTotal > 80 ? "high" : scoreTotal >= 60 ? "moderate" : "low"
+    string cid = (degree == 2 ? "2-" : "") + "WXY" + str.tostring(startIdx) + (xLegs == 3 ? "x" : "") + (yIsTri ? "t" : "")
+    string ptype = "Combination (WXY)"
+    string comboStruct = "W:" + wType + ":3|X:" + (xLegs == 3 ? "zigzag:3" : "leg:1") + "|Y:" + yType + ":" + str.tostring(yLegs)
+    float invLevel = yc
+    int legsUsed = 3 + xLegs + yLegs
+
+    valid := valid and propOk and barsStrictlyRising(pBr, startIdx, legsUsed)
+    bool anchored = anchoredStart(pP, startIdx, wIsUp, cfg.anchorLookback)
+    WaveCount.new(cid, ptype, valid, false, wIsUp, scoreTotal, fibScore, structScore, eqScore, timeScore, mtfScore,
+         invLevel, tier, ptype, false, 3, p0, wc, x, yc, na, na, bw, bx, byE, na, na, startIdx, comboStruct, degree, byE, anchored, legsUsed, momScore, tInfo)
+
+export evaluateComboWXYWindow(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int startIdx, EngineConfig cfg, float rsiSeries) =>
+    int nPiv = array.size(pP)
+    float p0 = array.get(pP, startIdx)
+
+    WaveCount wComp = evaluateZigzagFlatWindow(pP, pBr, vP, vB, degree, startIdx, cfg, rsiSeries)
+    float wc = wComp.w3e
+    int   bw = wComp.w3eBar
+    bool wIsUp = wc > p0
+    float wNet = math.abs(wc - p0)
+
+    float xS = array.get(pP, startIdx + 4)
+    int   bxS = array.get(pBr, startIdx + 4)
+    float xSRatio = wNet > 0 ? math.abs(xS - wc) / wNet : 0.0
+    bool  xSValid = xSRatio > 0.1 and xSRatio < 1.3
+    WaveCount candSingle = f_buildWXYFromX(pP, pBr, vP, vB, degree, startIdx, cfg, rsiSeries, wComp, p0, wc, bw, wIsUp, wNet, xS, bxS, 1, xSValid, startIdx + 4)
+
+    WaveCount candMulti = na
+    if startIdx + 9 <= nPiv - 1
+        WaveCount xComp = evaluateZigzagFlatWindow(pP, pBr, vP, vB, degree, startIdx + 3, cfg, rsiSeries)
+        if xComp.hardRulesPassed
+            float xM = xComp.w3e
+            int   bxM = xComp.w3eBar
+            float xMRatio = wNet > 0 ? math.abs(xM - wc) / wNet : 0.0
+            bool  xMValid = xMRatio > 0.1 and xMRatio < 1.3
+            candMulti := f_buildWXYFromX(pP, pBr, vP, vB, degree, startIdx, cfg, rsiSeries, wComp, p0, wc, bw, wIsUp, wNet, xM, bxM, 3, xMValid, startIdx + 6)
+
+    WaveCount result = candSingle
+    if not na(candMulti) and candMulti.hardRulesPassed and (not candSingle.hardRulesPassed or candMulti.scoreTotal > candSingle.scoreTotal)
+        result := candMulti
+    result
+
+export f_legRole(string parentType, int legIdx) =>
+    parentType == "Zigzag" ? (legIdx == 2 ? 2 : 1) : 0
+
+export evaluateLegWhole(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int srcStart, int srcEnd, EngineConfig cfg, float rsiSeries, bool enZigzag, bool enImpulse, bool enDiagonal, bool enTriangle, bool enCombo3, float minScore, int comboTolerance) =>
+    int evalDeg = math.max(degree, 1)
+    WaveCount wlBest = na
+    bool wlFromCombo = false
+    int wlSpan = srcEnd - srcStart
+    if wlSpan >= 3
+        if enZigzag
+            [wlC4p, wlC4b] = legCompressExact(pP, pBr, srcStart, srcEnd, 4)
+            if array.size(wlC4p) == 4
+                WaveCount wlZf = evaluateZigzagFlatWindow(wlC4p, wlC4b, vP, vB, evalDeg, 0, cfg, rsiSeries)
+                if wlZf.hardRulesPassed
+                    wlBest := wlZf
+        if wlSpan >= 5 and (enImpulse or enDiagonal or enTriangle)
+            [wlC6p, wlC6b] = legCompressExact(pP, pBr, srcStart, srcEnd, 6)
+            if array.size(wlC6p) == 6
+                if enImpulse
+                    WaveCount wlImp = evaluateImpulseWindow(wlC6p, wlC6b, vP, vB, evalDeg, 0, cfg, rsiSeries)
+                    if wlImp.hardRulesPassed and (na(wlBest) or wlImp.scoreTotal > wlBest.scoreTotal)
+                        wlBest := wlImp
+                if enDiagonal
+                    WaveCount wlDia = evaluateDiagonalWindow(wlC6p, wlC6b, vP, vB, evalDeg, 0, cfg, rsiSeries)
+                    if wlDia.hardRulesPassed and (na(wlBest) or wlDia.scoreTotal > wlBest.scoreTotal)
+                        wlBest := wlDia
+                if enTriangle
+                    WaveCount wlTri = evaluateTriangleWindow(wlC6p, wlC6b, vP, vB, evalDeg, 0, cfg, rsiSeries)
+                    if wlTri.hardRulesPassed and (na(wlBest) or wlTri.scoreTotal > wlBest.scoreTotal)
+                        wlBest := wlTri
+        if enCombo3 and wlSpan >= 7
+            WaveCount wlCombo = evaluateComboWXYWindow(pP, pBr, vP, vB, evalDeg, srcStart, cfg, rsiSeries)
+            int wlComboEnd = wlCombo.startIdx + wlCombo.legsConsumed
+            bool wlComboFull = wlComboEnd == srcEnd
+            bool wlComboCoversEnough = wlComboEnd <= srcEnd and wlComboEnd >= srcEnd - comboTolerance
+            if wlCombo.hardRulesPassed and wlComboCoversEnough
+                if na(wlBest)
+                    wlBest := wlCombo
+                    wlFromCombo := true
+                else if wlComboFull and wlCombo.scoreTotal > wlBest.scoreTotal
+                    wlBest := wlCombo
+                    wlFromCombo := true
+    if not na(wlBest)
+        if wlBest.scoreTotal < minScore
+            wlBest := na
+        else if wlFromCombo
+            wlBest.startIdx := srcStart
+        else
+            wlBest.startIdx := srcStart
+            wlBest.legsConsumed := srcEnd - srcStart
+    wlBest
+
+export evaluateComboWXYXZWindow(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int startIdx, EngineConfig cfg, float rsiSeries) =>
+    int nPiv = array.size(pP)
+    float p0 = array.get(pP, startIdx)
+
+    WaveCount wComp = evaluateZigzagFlatWindow(pP, pBr, vP, vB, degree, startIdx, cfg, rsiSeries)
+    string wType = wComp.patternType
+    float wc = wComp.w3e
+    int   bw = wComp.w3eBar
+    bool wIsUp = wc > p0
+    float wNet = math.abs(wc - p0)
+
+    float x1 = array.get(pP, startIdx + 4)
+    int   bx1 = array.get(pBr, startIdx + 4)
+    float x1Retrace = math.abs(x1 - wc)
+    float x1Ratio = wNet > 0 ? x1Retrace / wNet : 0.0
+    bool x1Valid = x1Ratio > 0.1 and x1Ratio < 1.3
+
+    WaveCount yComp = evaluateZigzagFlatWindow(pP, pBr, vP, vB, degree, startIdx + 4, cfg, rsiSeries)
+    string yType = yComp.patternType
+    float yc = yComp.w3e
+    int byE = yComp.w3eBar
+    bool yOk = yComp.hardRulesPassed
+
+    bool yIsUp = yc > x1
+    float yNet = math.abs(yc - x1)
+
+    float x2 = array.get(pP, startIdx + 8)
+    int bx2 = array.get(pBr, startIdx + 8)
+    float x2Retrace = math.abs(x2 - yc)
+    float x2Ratio = yNet > 0 ? x2Retrace / yNet : 0.0
+    bool x2Valid = x2Ratio > 0.1 and x2Ratio < 1.3
+
+    bool triSpace = startIdx + 13 <= nPiv - 1
+    bool zIsTri = false
+    WaveCount zComp = na
+    if triSpace
+        WaveCount zTriTry = evaluateTriangleWindow(pP, pBr, vP, vB, degree, startIdx + 8, cfg, rsiSeries)
+        if zTriTry.hardRulesPassed
+            zComp := zTriTry
+            zIsTri := true
+    if na(zComp)
+        zComp := evaluateZigzagFlatWindow(pP, pBr, vP, vB, degree, startIdx + 8, cfg, rsiSeries)
+
+    string zType = zIsTri ? "Triangle" : zComp.patternType
+    int zLegs = zIsTri ? 5 : 3
+    float zc = zIsTri ? zComp.w5e : zComp.w3e
+    int bzE = zIsTri ? zComp.w5eBar : zComp.w3eBar
+    bool zOk = zComp.hardRulesPassed
+
+    bool zIsUp = zc > x2
+    bool sameDirection = wIsUp == yIsUp and (zIsTri or yIsUp == zIsUp)
+    int zigzagCount = (wType == "Zigzag" ? 1 : 0) + (yType == "Zigzag" ? 1 : 0) + (zType == "Zigzag" ? 1 : 0)
+    bool oneZigzagMax = zigzagCount <= 1
+    float yNetFromP0 = math.abs(yc - p0)
+    float totalNet = math.abs(zc - p0)
+    bool netProgress = yNetFromP0 > wNet and (zIsTri or totalNet > yNetFromP0)
+
+    bool valid = wComp.hardRulesPassed and x1Valid and yOk and x2Valid and zOk and sameDirection and oneZigzagMax and netProgress
+
+    float fibScore = zIsTri ?
+         (wComp.scoreFib + yComp.scoreFib) / 2.0 :
+         (wComp.scoreFib + yComp.scoreFib + zComp.scoreFib) / 3.0
+
+    int zEndIdx = startIdx + 8 + zLegs
+    float pathLen = 0.0
+    for k = startIdx to zEndIdx - 1
+        pathLen := pathLen + math.abs(array.get(pP, k + 1) - array.get(pP, k))
+    float horizRatio = pathLen > 0 ? totalNet / pathLen : 1.0
+    float horizScore = math.max(0.0, 100.0 - horizRatio * 150.0)
+    float x1Score = math.max(0.0, 100.0 - math.abs(x1Ratio - 0.5) * 100.0)
+    float x2Score = math.max(0.0, 100.0 - math.abs(x2Ratio - 0.5) * 100.0)
+    float structScore = zIsTri ?
+         (horizScore + x1Score + x2Score + wComp.scoreAlternation + yComp.scoreAlternation) / 5.0 :
+         (horizScore + x1Score + x2Score + wComp.scoreAlternation + yComp.scoreAlternation + zComp.scoreAlternation) / 6.0
+
+    float zNet = math.abs(zc - x2)
+    array<float> netVals = array.from(wNet, yNet, zNet)
+    float maxNetVal = array.max(netVals)
+    float ratioEq = maxNetVal > 0 ? array.min(netVals) / maxNetVal : 0.0
+    float eqScore = 50.0 + 50.0 * ratioEq
+
+    int durW = bw - array.get(pBr, startIdx)
+    int durZ = bzE - bx2
+    int durY = byE - bx1
+    bool propOk = f_comboProportionOk(durY, f_maxLegDur(pBr, startIdx + 4, 3), durW, cfg) and f_comboProportionOk(durZ, f_maxLegDur(pBr, startIdx + 8, zLegs), durY, cfg)
+    string tInfo = f_joinExt(f_joinExt(f_truncRekey(wComp.extInfo, 1), f_truncRekey(yComp.extInfo, 3)), f_truncRekey(zComp.extInfo, 5))
+    float ratioT = durW > 0 ? durZ / float(durW) : 0.0
+    float timeScore = durW > 0 ? fibConformityScore(ratioT, cfg.timeLevels) : 50.0
+
+    float mtfScore = mtfAlignScore(wIsUp, cfg.dirD1, cfg.dirH4)
+    float momScore = f_momentumScore(pBr, degree, startIdx, 3, "Combination (WXYXZ)", rsiSeries, cfg.maxBarsBackSafe, true)
+    float scoreTotal = fibScore * cfg.wFib + structScore * cfg.wAlt + eqScore * cfg.wEq + timeScore * cfg.wTime + mtfScore * cfg.wMTF + momScore * cfg.wMomentum
+    string tier = scoreTotal > 80 ? "high" : scoreTotal >= 60 ? "moderate" : "low"
+    string cid = (degree == 2 ? "2-" : "") + "WXYXZ" + str.tostring(startIdx) + (zIsTri ? "t" : "")
+    string ptype = "Combination (WXYXZ)"
+    string comboStruct = "W:" + wType + ":3|X:leg:1|Y:" + yType + ":3|X:leg:1|Z:" + zType + ":" + str.tostring(zLegs)
+    float invLevel = zc
+    int legsUsed = 8 + zLegs
+
+    valid := valid and propOk and barsStrictlyRising(pBr, startIdx, legsUsed)
+    bool anchored = anchoredStart(pP, startIdx, wIsUp, cfg.anchorLookback)
+    WaveCount.new(cid, ptype, valid, false, wIsUp, scoreTotal, fibScore, structScore, eqScore, timeScore, mtfScore,
+         invLevel, tier, ptype, false, 5, p0, wc, x1, yc, x2, zc, bw, bx1, byE, bx2, bzE, startIdx, comboStruct, degree, bzE, anchored, legsUsed, momScore, tInfo)
+
+export revalidateCandidate(WaveCount c, array<float> pP, array<int> pBr, array<float> vP, array<int> vB, EngineConfig cfg, float rsiSeries) =>
+    string pt = c.patternType
+    int degree = c.degree
+    int startIdx = c.startIdx
+    int b0 = array.get(pBr, startIdx)
+    bool ok = c.hardRulesPassed
+    float refinedScore = c.scoreTotal
+    array<int>   rlBarS = array.new_int(0)
+    array<int>   rlBarE = array.new_int(0)
+    array<float> rlPriS = array.new_float(0)
+    array<float> rlPriE = array.new_float(0)
+    array<bool>  rlMot  = array.new_bool(0)
+    if pt == "Impulse"
+        array.push(rlBarS, b0)
+        array.push(rlBarE, c.w1eBar)
+        array.push(rlPriS, c.w1s)
+        array.push(rlPriE, c.w1e)
+        array.push(rlMot, true)
+        array.push(rlBarS, c.w2eBar)
+        array.push(rlBarE, c.w3eBar)
+        array.push(rlPriS, c.w2e)
+        array.push(rlPriE, c.w3e)
+        array.push(rlMot, true)
+        array.push(rlBarS, c.w4eBar)
+        array.push(rlBarE, c.w5eBar)
+        array.push(rlPriS, c.w4e)
+        array.push(rlPriE, c.w5e)
+        array.push(rlMot, true)
+    else if pt == "Zigzag" or str.contains(pt, "Flat")
+        array.push(rlBarS, b0)
+        array.push(rlBarE, c.w1eBar)
+        array.push(rlPriS, c.w1s)
+        array.push(rlPriE, c.w1e)
+        array.push(rlMot, pt == "Zigzag")
+        array.push(rlBarS, c.w2eBar)
+        array.push(rlBarE, c.w3eBar)
+        array.push(rlPriS, c.w2e)
+        array.push(rlPriE, c.w3e)
+        array.push(rlMot, true)
+    else if str.contains(pt, "WXYXZ")
+        WaveCount rc = evaluateComboWXYXZWindow(pP, pBr, vP, vB, degree, startIdx, cfg, rsiSeries)
+        ok := rc.hardRulesPassed
+        refinedScore := rc.scoreTotal
+    else if str.contains(pt, "WXY")
+        WaveCount rc = evaluateComboWXYWindow(pP, pBr, vP, vB, degree, startIdx, cfg, rsiSeries)
+        ok := rc.hardRulesPassed
+        refinedScore := rc.scoreTotal
+    int rlN = array.size(rlBarS)
+    if rlN > 0
+        bool rlAllOk = true
+        array<int> rlWaveNo = pt == "Impulse" ? array.from(1, 3, 5) : array.from(1, 3)
+        string rlExt = ""
+        for rli = 0 to rlN - 1
+            [rlLegOk, rlLegSc, rlStage, rlSub, rlCnt, rlBranch] = f_realLegCheck(vP, vB, array.get(rlBarS, rli), array.get(rlBarE, rli), array.get(rlPriS, rli), array.get(rlPriE, rli), array.get(rlMot, rli), degree, cfg, rsiSeries)
+            rlAllOk := rlAllOk and rlLegOk
+            if rli < array.size(rlWaveNo)
+                rlExt := rlExt + (str.length(rlExt) > 0 ? "," : "") + str.tostring(array.get(rlWaveNo, rli)) + ":" + str.tostring(rlStage) + ":" + str.tostring(rlStage > 0 ? rlSub : rlCnt) + ":" + str.tostring(rlBranch)
+        ok := c.hardRulesPassed and rlAllOk
+        c.extInfo := f_joinExt(rlExt, f_truncRecords(c.extInfo))
+    c.hardRulesPassed := ok
+    c.scoreTotal := refinedScore
+    c.confidenceTier := refinedScore > 80 ? "high" : refinedScore >= 60 ? "moderate" : "low"
+    c
+
+export f_extGlyph(string extInfo, int waveNo) =>
+    string g = ""
+    if str.length(extInfo) > 0
+        array<string> parts = str.split(extInfo, ",")
+        int nParts = array.size(parts)
+        for pi = 0 to (nParts > 0 ? nParts - 1 : 0)
+            array<string> f = nParts > 0 ? str.split(array.get(parts, pi), ":") : array.new_string(0)
+            if array.size(f) >= 4 and str.tonumber(array.get(f, 0)) == waveNo
+                string st = array.get(f, 1)
+                g := st == "9" ? " ⁹" : st == "13" ? " ¹³" : st == "17" ? " ¹⁷" : ""
+    g
+
+export f_extTooltip(string extInfo, int waveNo) =>
+    string t = ""
+    if str.length(extInfo) > 0
+        array<string> parts = str.split(extInfo, ",")
+        int nParts = array.size(parts)
+        for pi = 0 to (nParts > 0 ? nParts - 1 : 0)
+            array<string> f = nParts > 0 ? str.split(array.get(parts, pi), ":") : array.new_string(0)
+            if array.size(f) >= 4 and str.tonumber(array.get(f, 0)) == waveNo
+                string st = array.get(f, 1)
+                string sub = array.get(f, 2)
+                string subName = sub == "1" ? "i" : sub == "3" ? "iii" : sub == "5" ? "v" : "?"
+                if st != "0"
+                    t := "\nExtension: this wave subdivides into " + st + " waves instead of 5" +
+                         (st == "13" ? " (extension within an extension)" : st == "17" ? " (extension within an extension within an extension)" : "") +
+                         " — the elongated sub-wave is " + subName + "."
+    t
+
+export f_truncGlyph(string extInfo, int waveNo, bool live) =>
+    string g = ""
+    if str.length(extInfo) > 0
+        array<string> parts = str.split(extInfo, ",")
+        int nParts = array.size(parts)
+        for pi = 0 to (nParts > 0 ? nParts - 1 : 0)
+            array<string> f = nParts > 0 ? str.split(array.get(parts, pi), ":") : array.new_string(0)
+            if array.size(f) == 3 and str.startswith(array.get(f, 0), "T") and str.tonumber(array.get(f, 1)) == waveNo
+                g := live ? " ᵀ ?" : " ᵀ"
+    g
+
+export f_truncTooltip(string extInfo, int waveNo, bool live) =>
+    string t = ""
+    if str.length(extInfo) > 0
+        array<string> parts = str.split(extInfo, ",")
+        int nParts = array.size(parts)
+        for pi = 0 to (nParts > 0 ? nParts - 1 : 0)
+            array<string> f = nParts > 0 ? str.split(array.get(parts, pi), ":") : array.new_string(0)
+            if array.size(f) == 3 and str.startswith(array.get(f, 0), "T") and str.tonumber(array.get(f, 1)) == waveNo
+                string kind = array.get(f, 0)
+                string pct = array.get(f, 2)
+                string what = "wave C ends " + pct + "% of wave A short of the end of wave A"
+                if kind == "T5"
+                    what := "wave 5 ends " + pct + "% of wave 3 short of the end of wave 3 (truncated fifth)"
+                else if kind == "TR"
+                    what := what + " while B went beyond the start of A (running flat)"
+                else
+                    what := what + " (within the C-end tolerance 2.7.6, score malus applied)"
+                string tail = live ? " — not yet confirmed: this point is still the newest pivot of its level, the wave may still extend." : " — confirmed by a later pivot on this level."
+                t := (live ? "\nPossible truncation: " : "\nTruncation: ") + what + tail
+    t
+
+export f_lblDecor(string extInfo, int waveNo, bool showExt, bool showTrunc, bool live) =>
+    string g = showExt ? f_extGlyph(extInfo, waveNo) : ""
+    string t = showExt ? f_extTooltip(extInfo, waveNo) : ""
+    if showTrunc
+        g := g + f_truncGlyph(extInfo, waveNo, live)
+        t := t + f_truncTooltip(extInfo, waveNo, live)
+    [g, t]
+
+export f_realGapFill(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, EngineConfig cfg, float rsiSeries, array<bool> segCoveredArr, array<WaveCount> chainStepsArr, int minGapSpan, bool tryCombo3, bool tryCombo5, bool tryImpulse, bool tryDiagonal, bool tryTriangle, bool tryZigzag, float minScore) =>
+    int rgSegN = array.size(segCoveredArr)
+    int rgStartIdx = na
+    for rgi = 0 to rgSegN
+        bool rgCovered = rgi < rgSegN ? array.get(segCoveredArr, rgi) : true
+        if not rgCovered and na(rgStartIdx)
+            rgStartIdx := rgi
+        if rgCovered and not na(rgStartIdx)
+            if rgi - rgStartIdx >= minGapSpan
+                int rgEndIdx = math.min(rgi, rgSegN - 1)
+                WaveCount rgBest = na
+                int rgBestLegs = 0
+                float rgBestScore = 0.0
+                for rgPos = rgStartIdx to rgEndIdx - 1
+                    int rgPosInterior = rgEndIdx - rgPos - 1
+                    if tryCombo3 and rgPosInterior >= 6
+                        WaveCount rgC3 = evaluateComboWXYWindow(pP, pBr, vP, vB, 1, rgPos, cfg, rsiSeries)
+                        int rgC3End = rgC3.startIdx + rgC3.legsConsumed
+                        if rgC3.hardRulesPassed and rgC3End <= rgEndIdx and (rgC3.legsConsumed > rgBestLegs or (rgC3.legsConsumed == rgBestLegs and rgC3.scoreTotal > rgBestScore))
+                            rgBest := rgC3
+                            rgBestLegs := rgC3.legsConsumed
+                            rgBestScore := rgC3.scoreTotal
+                    if tryCombo5 and rgPosInterior >= 10
+                        WaveCount rgC5 = evaluateComboWXYXZWindow(pP, pBr, vP, vB, 1, rgPos, cfg, rsiSeries)
+                        int rgC5End = rgC5.startIdx + rgC5.legsConsumed
+                        if rgC5.hardRulesPassed and rgC5End <= rgEndIdx and (rgC5.legsConsumed > rgBestLegs or (rgC5.legsConsumed == rgBestLegs and rgC5.scoreTotal > rgBestScore))
+                            rgBest := rgC5
+                            rgBestLegs := rgC5.legsConsumed
+                            rgBestScore := rgC5.scoreTotal
+                    if tryImpulse and rgPosInterior >= 4
+                        WaveCount rgImp = evaluateImpulseWindow(pP, pBr, vP, vB, 1, rgPos, cfg, rsiSeries)
+                        int rgImpEnd = rgImp.startIdx + rgImp.legsConsumed
+                        if rgImp.hardRulesPassed and rgImpEnd <= rgEndIdx and (rgImp.legsConsumed > rgBestLegs or (rgImp.legsConsumed == rgBestLegs and rgImp.scoreTotal > rgBestScore))
+                            rgBest := rgImp
+                            rgBestLegs := rgImp.legsConsumed
+                            rgBestScore := rgImp.scoreTotal
+                    if tryDiagonal and rgPosInterior >= 4
+                        WaveCount rgDiag = evaluateDiagonalWindow(pP, pBr, vP, vB, 1, rgPos, cfg, rsiSeries)
+                        int rgDiagEnd = rgDiag.startIdx + rgDiag.legsConsumed
+                        if rgDiag.hardRulesPassed and rgDiagEnd <= rgEndIdx and (rgDiag.legsConsumed > rgBestLegs or (rgDiag.legsConsumed == rgBestLegs and rgDiag.scoreTotal > rgBestScore))
+                            rgBest := rgDiag
+                            rgBestLegs := rgDiag.legsConsumed
+                            rgBestScore := rgDiag.scoreTotal
+                    if tryTriangle and rgPosInterior >= 4
+                        WaveCount rgTri = evaluateTriangleWindow(pP, pBr, vP, vB, 1, rgPos, cfg, rsiSeries)
+                        int rgTriEnd = rgTri.startIdx + rgTri.legsConsumed
+                        if rgTri.hardRulesPassed and rgTriEnd <= rgEndIdx and (rgTri.legsConsumed > rgBestLegs or (rgTri.legsConsumed == rgBestLegs and rgTri.scoreTotal > rgBestScore))
+                            rgBest := rgTri
+                            rgBestLegs := rgTri.legsConsumed
+                            rgBestScore := rgTri.scoreTotal
+                    if tryZigzag and rgPosInterior >= 2
+                        WaveCount rgZf = evaluateZigzagFlatWindow(pP, pBr, vP, vB, 1, rgPos, cfg, rsiSeries)
+                        int rgZfEnd = rgZf.startIdx + rgZf.legsConsumed
+                        if rgZf.hardRulesPassed and rgZfEnd <= rgEndIdx and (rgZf.legsConsumed > rgBestLegs or (rgZf.legsConsumed == rgBestLegs and rgZf.scoreTotal > rgBestScore))
+                            rgBest := rgZf
+                            rgBestLegs := rgZf.legsConsumed
+                            rgBestScore := rgZf.scoreTotal
+                    if na(rgBest) and tryImpulse and rgPosInterior == 2 and array.size(vB) > 0
+                        WaveCount rgRec = evaluateImpulseRecoveredWindow(pP, pBr, vP, vB, 1, rgPos, cfg, rsiSeries)
+                        if rgRec.hardRulesPassed
+                            rgBest := rgRec
+                            rgBestLegs := rgRec.legsConsumed
+                            rgBestScore := rgRec.scoreTotal
+                if not na(rgBest)
+                    WaveCount rgFinal = array.size(vB) == 0 ? rgBest : revalidateCandidate(rgBest, pP, pBr, vP, vB, cfg, rsiSeries)
+                    if rgFinal.hardRulesPassed and rgFinal.scoreTotal >= minScore
+                        rgFinal.countId := rgFinal.countId + "-GF"
+                        array.push(chainStepsArr, rgFinal)
+                        for rgSegI = rgFinal.startIdx to math.min(rgFinal.startIdx + rgFinal.legsConsumed, array.size(segCoveredArr)) - 1
+                            array.set(segCoveredArr, rgSegI, true)
+            rgStartIdx := na
+    true
+
+export f_atomicDiagText(int n) =>
+    n < 4 ?
+         " DIAGNOSIS: atomic — the finer detector holds only " + str.tostring(n) + " pivot points across this stretch; no counter-move exceeded even the fine threshold. Internal structure, if any, lives below this resolution — use the finer-timeframe hint above." :
+         " DIAGNOSIS: sub-structure present — " + str.tostring(n) + " finer pivot points, but no rule-valid Elliott pattern of any enabled type fits them. Candidate for genuine noise or a pivot-threshold adjustment."
+
+export f_drawWholeLegFallback(array<label> targetLabels, array<line> targetLines, int t0, int t1, float p0, float p1, int pivotCount, string waveLetter, string degText, bool showLabel, bool showLine, float labelOffsetAmt, color labelBgColor, color labelTextColor, string labelSizeName, color lineColor, int lineWidth, string lineStyleName) =>
+    bool atomic = pivotCount < 4
+    if showLabel
+        float midPr = (p0 + p1) / 2.0 - labelOffsetAmt
+        lbl = label.new(int((t0 + t1) / 2), midPr, atomic ? "▫" : "!", xloc=xloc.bar_time, style=label.style_label_up,
+             color=labelBgColor, textcolor=labelTextColor, size=getLabelSize(labelSizeName),
+             tooltip="Leg " + waveLetter + " (" + degText + ") — no valid pattern possible for this WHOLE leg at any tried resolution." + f_atomicDiagText(pivotCount))
+        array.push(targetLabels, lbl)
+    if showLine
+        ln = line.new(t0, p0, t1, p1, xloc=xloc.bar_time, color=lineColor, width=lineWidth, style=f_lineStyle(lineStyleName))
+        array.push(targetLines, ln)
+
+export f_drawWholeLegFallbackFromPivots(array<label> targetLabels, array<line> targetLines, array<int> times, array<float> prices, int idx0, int idx1, int pivotCount, string waveLetter, string degText, bool showLabel, bool showLine, float labelOffsetAmt, color labelBgColor, color labelTextColor, string labelSizeName, color lineColor, int lineWidth, string lineStyleName) =>
+    f_drawWholeLegFallback(targetLabels, targetLines, array.get(times, idx0), array.get(times, idx1), array.get(prices, idx0), array.get(prices, idx1), pivotCount, waveLetter, degText, showLabel, showLine, labelOffsetAmt, labelBgColor, labelTextColor, labelSizeName, lineColor, lineWidth, lineStyleName)
+
+export f_drawWholeLegFallbackFromArrays(array<label> targetLabels, array<line> targetLines, array<int> times, array<float> prices, int timeIdx0, int timeIdx1, int priceIdx0, int priceIdx1, int pivotCount, string waveLetter, string degText, bool showLabel, bool showLine, float labelOffsetAmt, color labelBgColor, color labelTextColor, string labelSizeName, color lineColor, int lineWidth, string lineStyleName) =>
+    f_drawWholeLegFallback(targetLabels, targetLines, array.get(times, timeIdx0), array.get(times, timeIdx1), array.get(prices, priceIdx0), array.get(prices, priceIdx1), pivotCount, waveLetter, degText, showLabel, showLine, labelOffsetAmt, labelBgColor, labelTextColor, labelSizeName, lineColor, lineWidth, lineStyleName)
+
+export f_drawExplanationLabel(array<label> targetLabels, int t, float p, bool isHigh, color bgColor, color textColor, string sizeName, string tooltipText) =>
+    lbl = label.new(t, p, "i", xloc=xloc.bar_time, style=isHigh ? label.style_label_down : label.style_label_up,
+         color=bgColor, textcolor=textColor, size=getLabelSize(sizeName), tooltip=tooltipText)
+    array.push(targetLabels, lbl)
+
+getLabelTextArray(string patternType, bool useRoman) =>
+    bool isImpulseLike = patternType == "Impulse" or str.startswith(patternType, "Diagonal")
+    bool isTriangleLike = str.startswith(patternType, "Triangle")
+    bool isCombo3 = patternType == "Combination (WXY)"
+    bool isCombo5 = patternType == "Combination (WXYXZ)"
+    array<string> result = array.from("A", "B", "C", "", "")
+    if isImpulseLike
+        result := useRoman ? array.from("I", "II", "III", "IV", "V") : array.from("1", "2", "3", "4", "5")
+    else if isTriangleLike
+        result := array.from("A", "B", "C", "D", "E")
+    else if isCombo3
+        result := array.from("W", "X", "Y", "", "")
+    else if isCombo5
+        result := array.from("W", "X", "Y", "X", "Z")
+    result
+
+export getDegreeLabel(string tf) =>
+    float secs = timeframe.in_seconds(tf)
+    string d = "Subminuette"
+    if secs >= 31536000
+        d := "Cycle"
+    else if secs >= 2592000
+        d := "Primary"
+    else if secs >= 604800
+        d := "Intermediate"
+    else if secs >= 86400
+        d := "Minor"
+    else if secs >= 14400
+        d := "Minute"
+    else if secs >= 1800
+        d := "Minuette"
+    d
+
+export shiftDegreeUp(string d) =>
+    switch d
+        "Subminuette" => "Minuette"
+        "Minuette"    => "Minute"
+        "Minute"      => "Minor"
+        "Minor"       => "Intermediate"
+        "Intermediate"=> "Primary"
+        "Primary"     => "Cycle"
+        "Cycle"       => "Super Cycle"
+        "Super Cycle" => "Grand Super Cycle"
+        => d
+
+export shiftDegreeDown(string d) =>
+    switch d
+        "Grand Super Cycle" => "Super Cycle"
+        "Super Cycle" => "Cycle"
+        "Cycle"       => "Primary"
+        "Primary"     => "Intermediate"
+        "Intermediate"=> "Minor"
+        "Minor"       => "Minute"
+        "Minute"      => "Minuette"
+        "Minuette"    => "Subminuette"
+        "Subminuette" => "Micro"
+        => d
+
+export f_degreeNameFor(int deg, string chartTF) =>
+    string d = getDegreeLabel(chartTF)
+    if deg > 1
+        for s = 1 to deg - 1
+            d := shiftDegreeUp(d)
+    else if deg < 1
+        for s = 1 to 1 - deg
+            d := shiftDegreeDown(d)
+    d
+
+f_notationTier(string deg) =>
+    string numMode = "arabic"
+    string brMode = "plain"
+    if deg == "Grand Super Cycle"
+        numMode := "roman_upper"
+        brMode := "bracket"
+    else if deg == "Super Cycle"
+        numMode := "roman_upper"
+        brMode := "paren"
+    else if deg == "Cycle"
+        numMode := "roman_upper"
+        brMode := "plain"
+    else if deg == "Primary"
+        numMode := "arabic"
+        brMode := "bracket"
+    else if deg == "Intermediate"
+        numMode := "arabic"
+        brMode := "paren"
+    else if deg == "Minor"
+        numMode := "arabic"
+        brMode := "plain"
+    else if deg == "Minute"
+        numMode := "roman_lower"
+        brMode := "bracket"
+    else if deg == "Minuette"
+        numMode := "roman_lower"
+        brMode := "paren"
+    else if deg == "Subminuette"
+        numMode := "roman_lower"
+        brMode := "plain"
+    else if deg == "Micro"
+        numMode := "arabic"
+        brMode := "bracket"
+    [numMode, brMode]
+
+f_applyNotation(array<string> texts, string numMode, string brMode) =>
+    array<string> result = array.new_string(array.size(texts))
+    if array.size(texts) > 0
+        for i = 0 to array.size(texts) - 1
+            string t = array.get(texts, i)
+            if t != ""
+                if numMode == "roman_lower"
+                    t := str.lower(t)
+                t := brMode == "bracket" ? "[" + t + "]" : brMode == "paren" ? "(" + t + ")" : t
+            array.set(result, i, t)
+    result
+
+export f_notatedLabelTextArray(string patternType, int deg, string chartTF) =>
+    string degName = f_degreeNameFor(deg, chartTF)
+    [numMode, brMode] = f_notationTier(degName)
+    bool useRoman = numMode != "arabic"
+    array<string> base = getLabelTextArray(patternType, useRoman)
+    f_applyNotation(base, numMode, brMode)
+
+export f_legDominance(array<int> bars, int s, int e) =>
+    float dom = 0.0
+    int n = array.size(bars)
+    int eC = math.min(e, n - 1)
+    int sC = math.max(s, 0)
+    if eC > sC
+        int total = array.get(bars, eC) - array.get(bars, sC)
+        if total > 0
+            int maxLeg = 0
+            for k = sC to eC - 1
+                int legLen = array.get(bars, k + 1) - array.get(bars, k)
+                if legLen > maxLeg
+                    maxLeg := legLen
+            dom := 1.0 * maxLeg / total
+    dom
+
+export f_evalCandDegStep(array<int> bars, int b0, int b1, float maxDominance) =>
+    int s = subLowerBound(bars, b0 - 1)
+    int e = subLowerBound(bars, b1) - 1
+    bool passed = e - s >= 3 and f_legDominance(bars, s, e) <= maxDominance
+    [s, e, passed]
+
+export f_evalFloorLeg(array<int> bars, int b0, int b1, float maxDominance) =>
+    int s = subLowerBound(bars, b0)
+    int e = subLowerBound(bars, b1 - 1)
+    bool passed = e > s and f_legDominance(bars, s, e) <= maxDominance
+    [s, e, passed]
+
+export f_legWholeDominance(WaveCount wlc, array<int> bars) =>
+    float dom = 0.0
+    if not na(wlc) and wlc.numPoints > 0 and wlc.startIdx >= 0 and wlc.startIdx < array.size(bars)
+        array<int> pb = array.from(array.get(bars, wlc.startIdx), wlc.w1eBar, wlc.w2eBar, wlc.w3eBar, wlc.w4eBar, wlc.w5eBar)
+        dom := f_legDominance(pb, 0, wlc.numPoints)
+    dom
+
+export f_depth2InnerLegs(array<label> targetLabels, array<line> targetLines, array<WaveCount> steps, array<int> stepBars, array<float> sP, array<int> sB, array<int> sTimes, array<int> pBars, array<int> pTimes, string chartTF, int notationDeg, EngineConfig cfg, float rsiSeries, bool enZigzag, bool enImpulse, bool enDiagonal, bool enTriangle, bool enCombo3, float minScore, int comboTolerance, float maxDominance, float minLegBars, color lblColor, string lblSizeName, float offTop, float offBottom, bool showLine, color lineColorUp, color lineColorDown, int lineWidth, string lineStyleName, bool showMarkLbl, bool showMarkLine, float markOffsetAmt, color markBgColor, color markTextColor, string markSizeName, color markLineColor, int markLineWidth, string markLineStyleName, bool showFinal) =>
+    if array.size(steps) > 0 and array.size(sB) > 2 and array.size(sTimes) == array.size(sB)
+        for si = 0 to array.size(steps) - 1
+            WaveCount st = array.get(steps, si)
+            if not na(st) and st.numPoints > 0 and st.startIdx >= 0 and st.startIdx < array.size(stepBars)
+                int prevBar = array.get(stepBars, st.startIdx)
+                array<int> ptB = array.from(st.w1eBar, st.w2eBar, st.w3eBar, st.w4eBar, st.w5eBar)
+                array<float> ptPst = array.from(st.w1e, st.w2e, st.w3e, st.w4e, st.w5e)
+                float prevPr = st.w1s
+                int covStartBar = array.get(sB, 0)
+                for j = 0 to st.numPoints - 1
+                    int   endBarV = array.get(ptB, j)
+                    float endPrV  = array.get(ptPst, j)
+                    if not na(endBarV) and not na(prevBar) and endBarV - prevBar >= minLegBars and (na(covStartBar) or covStartBar > prevBar)
+                        if showMarkLbl or showMarkLine
+                            int covT0 = f_barValToTime(pBars, pTimes, prevBar)
+                            covT0 := na(covT0) ? f_barValToTime(sB, sTimes, prevBar) : covT0
+                            int covT1 = f_barValToTime(pBars, pTimes, endBarV)
+                            covT1 := na(covT1) ? f_barValToTime(sB, sTimes, endBarV) : covT1
+                            if not na(covT1) and not na(endPrV)
+                                string covTip = "Depth-2: sub-pivot history does not reach back to this leg's start (aged out at the max stored sub-pivots cap) — no depth-2 evaluation possible here. Increase 'Max. stored sub-pivots' or the auto-scale tier for more look-back."
+                                if showMarkLine and not na(covT0) and not na(prevPr)
+                                    covLn = line.new(covT0, prevPr, covT1, endPrV, xloc=xloc.bar_time, color=markLineColor, width=markLineWidth, style=f_lineStyle(markLineStyleName))
+                                    array.push(targetLines, covLn)
+                                if showMarkLbl
+                                    int   covLT = na(covT0) ? covT1 : int((covT0 + covT1) / 2)
+                                    float covLP = (nz(prevPr, endPrV) + endPrV) / 2.0 - markOffsetAmt
+                                    covLbl = label.new(covLT, covLP, "!", xloc=xloc.bar_time, style=label.style_label_up, color=markBgColor, textcolor=markTextColor, size=getLabelSize(markSizeName), tooltip=covTip)
+                                    array.push(targetLabels, covLbl)
+                    else if not na(endBarV) and not na(prevBar) and endBarV - prevBar >= minLegBars
+                        [ls, le, lPassed] = f_evalFloorLeg(sB, prevBar, endBarV, maxDominance)
+                        WaveCount w2 = na
+                        if lPassed
+                            int d2Role = f_legRole(st.patternType, j + 1)
+                            w2 := evaluateLegWhole(sP, sB, sP, sB, 0, ls, le, cfg, rsiSeries, enZigzag and d2Role != 1, enImpulse and d2Role != 2, enDiagonal and d2Role != 2, enTriangle and d2Role != 1, enCombo3 and d2Role != 1, minScore, comboTolerance)
+                            if not na(w2) and f_legWholeDominance(w2, sB) > maxDominance
+                                w2 := na
+                        if not na(w2) and w2.numPoints > 0 and w2.startIdx >= 0 and w2.startIdx < array.size(sTimes)
+                            array<string> tx = f_notatedLabelTextArray(w2.patternType, notationDeg, chartTF)
+                            int   tPrev = array.get(sTimes, w2.startIdx)
+                            float pPrev = w2.w1s
+                            array<float> ptP2 = array.from(w2.w1e, w2.w2e, w2.w3e, w2.w4e, w2.w5e)
+                            array<int>   ptB2 = array.from(w2.w1eBar, w2.w2eBar, w2.w3eBar, w2.w4eBar, w2.w5eBar)
+                            for k = 0 to w2.numPoints - 1
+                                float pr = array.get(ptP2, k)
+                                int   tk = f_barValToTime(sB, sTimes, array.get(ptB2, k))
+                                if not na(tk) and not na(pr)
+                                    if showLine and not na(tPrev)
+                                        d2Ln = line.new(tPrev, pPrev, tk, pr, xloc=xloc.bar_time, color = pr > pPrev ? lineColorUp : lineColorDown, width=lineWidth, style=f_lineStyle(lineStyleName))
+                                        array.push(targetLines, d2Ln)
+                                    if k < w2.numPoints - (showFinal ? 0 : 1) and k < array.size(tx)
+                                        bool d2High = pr > pPrev
+                                        d2Lbl = label.new(tk, d2High ? pr + offTop : pr - offBottom, array.get(tx, k), xloc=xloc.bar_time, style=label.style_none, textcolor=lblColor, size=getLabelSize(lblSizeName))
+                                        array.push(targetLabels, d2Lbl)
+                                    tPrev := tk
+                                    pPrev := pr
+                        else if (showMarkLbl or showMarkLine) and le > ls and le < array.size(sTimes)
+                            int   mt0 = array.get(sTimes, ls)
+                            int   mt1 = array.get(sTimes, le)
+                            float mp0 = array.get(sP, ls)
+                            float mp1 = array.get(sP, le)
+                            if not na(mt0) and not na(mt1)
+                                f_drawWholeLegFallback(targetLabels, targetLines, mt0, mt1, mp0, mp1, le - ls + 1, "d2", "inner leg, depth-2", showMarkLbl, showMarkLine, markOffsetAmt, markBgColor, markTextColor, markSizeName, markLineColor, markLineWidth, markLineStyleName)
+                    prevBar := na(endBarV) ? prevBar : endBarV
+                    prevPr  := na(endPrV) ? prevPr : endPrV
+
+export f_drawDateMarker(bool showIt, int tMark, float yLo, float yHi, float yLbl, color col, string nameTxt, string tzId, int lineWidth) =>
+    line  mLn = na
+    label mLbl = na
+    if showIt
+        mLn := line.new(tMark, yLo, tMark, yHi, xloc=xloc.bar_time, extend=extend.both, color=col, style=line.style_dotted, width=lineWidth)
+        mLbl := label.new(tMark, yLbl, nameTxt + "\n" + str.format_time(tMark, "dd MMM yyyy HH:mm", tzId), xloc=xloc.bar_time, style=label.style_none, textcolor=col, size=size.small)
+    [mLn, mLbl]
+
+export f_drawRoutedLeg(array<line> targetLines, array<int> subBars, array<int> subTimes, array<float> subPrices, int t1, float v1, int t2, float v2, int b0, int b1, bool longEnough, color col, int segWidth, string lnStyle) =>
+    bool routed = false
+    int rS0 = subLowerBound(subBars, b0)
+    int rS1 = subLowerBound(subBars, b1 - 1)
+    int rMax = math.min(rS1, array.size(subBars) - 1)
+    if longEnough and rMax >= rS0 and rMax - rS0 <= 40
+        int   rPrevT = t1
+        float rPrevP = v1
+        for rJ = rS0 to rMax
+            int rBarJ = array.get(subBars, rJ)
+            if rBarJ > b0 and rBarJ < b1
+                int   rT = array.get(subTimes, rJ)
+                float rP = array.get(subPrices, rJ)
+                line rSeg = line.new(rPrevT, rPrevP, rT, rP, xloc=xloc.bar_time, color=col, width=segWidth, style=f_lineStyle(lnStyle))
+                array.push(targetLines, rSeg)
+                rPrevT := rT
+                rPrevP := rP
+                routed := true
+        if routed
+            line rEnd = line.new(rPrevT, rPrevP, t2, v2, xloc=xloc.bar_time, color=col, width=segWidth, style=f_lineStyle(lnStyle))
+            array.push(targetLines, rEnd)
+    routed
+
+f_discFive(int c) =>
+    c >= 4 ? 100.0 : c == 3 ? 75.0 : c == 2 ? 45.0 : c == 1 ? 25.0 : 10.0
+f_discThree(int c) =>
+    c == 2 ? 100.0 : c <= 1 ? 90.0 : c == 3 ? 70.0 : c == 4 ? 45.0 : 25.0
+
+export f_discriminateWindow(array<float> pP, array<int> pBr, array<int> vB, int startIdx, bool impOk, bool diagOk, bool triOk, float floorFit, float margin, bool useSubCount) =>
+    bool keepImp = impOk
+    bool keepDiag = diagOk
+    bool keepTri = triOk
+    float fitImp = -1.0
+    float fitDiag = -1.0
+    float fitTri = -1.0
+    if impOk or diagOk or triOk
+        float s0 = array.get(pP, startIdx)
+        float e1 = array.get(pP, startIdx + 1)
+        float e2 = array.get(pP, startIdx + 2)
+        float e3 = array.get(pP, startIdx + 3)
+        float e4 = array.get(pP, startIdx + 4)
+        float e5 = array.get(pP, startIdx + 5)
+        int b0 = array.get(pBr, startIdx)
+        int b1 = array.get(pBr, startIdx + 1)
+        int b2 = array.get(pBr, startIdx + 2)
+        int b3 = array.get(pBr, startIdx + 3)
+        int b4 = array.get(pBr, startIdx + 4)
+        int b5 = array.get(pBr, startIdx + 5)
+        bool dIsUp = e1 > s0
+        float len1 = math.abs(e1 - s0)
+        float len2 = math.abs(e2 - e1)
+        float len3 = math.abs(e3 - e2)
+        float len4 = math.abs(e4 - e3)
+        float len5 = math.abs(e5 - e4)
+        float winHi = math.max(s0, math.max(e1, math.max(e2, math.max(e3, math.max(e4, e5)))))
+        float winLo = math.min(s0, math.min(e1, math.min(e2, math.min(e3, math.min(e4, e5)))))
+        float winH = math.max(1e-10, winHi - winLo)
+        float chordAt3 = b5 != b1 ? e1 + (e5 - e1) * (b3 - b1) / float(b5 - b1) : e1
+        float devSigned = (e3 - chordAt3) / winH * (dIsUp ? 1.0 : -1.0)
+        float m1Wedge = math.max(0.0, 100.0 - math.abs(devSigned) * 400.0)
+        float m1Imp = math.min(100.0, math.max(0.0, 50.0 + devSigned * 250.0))
+        float pathSum = len1 + len2 + len3 + len4 + len5
+        float netProg = pathSum > 0 ? math.abs(e5 - s0) / pathSum : 0.0
+        float m2Tri = math.max(0.0, 100.0 - netProg / 0.30 * 100.0)
+        float m2Diag = math.max(0.0, 100.0 - math.abs(netProg - 0.45) / 0.35 * 100.0)
+        float m2Imp = math.min(100.0, math.max(0.0, (netProg - 0.20) / 0.50 * 100.0))
+        float m3Imp = 50.0
+        float m3Wedge = 50.0
+        if useSubCount and array.size(vB) > 0
+            int c1 = math.max(0, subLowerBound(vB, b1 - 1) - subLowerBound(vB, b0))
+            int c2 = math.max(0, subLowerBound(vB, b2 - 1) - subLowerBound(vB, b1))
+            int c3 = math.max(0, subLowerBound(vB, b3 - 1) - subLowerBound(vB, b2))
+            int c4 = math.max(0, subLowerBound(vB, b4 - 1) - subLowerBound(vB, b3))
+            int c5 = math.max(0, subLowerBound(vB, b5 - 1) - subLowerBound(vB, b4))
+            m3Imp := (f_discFive(c1) + f_discThree(c2) + f_discFive(c3) + f_discThree(c4) + f_discFive(c5)) / 5.0
+            m3Wedge := (f_discThree(c1) + f_discThree(c2) + f_discThree(c3) + f_discThree(c4) + f_discThree(c5)) / 5.0
+        float sp1 = len1 / math.max(1, b1 - b0)
+        float sp3 = len3 / math.max(1, b3 - b2)
+        float sp5 = len5 / math.max(1, b5 - b4)
+        float m4Imp = (sp3 >= sp1 and sp3 >= sp5) ? 100.0 : 40.0
+        float m4Wedge = (sp3 <= sp1 and sp5 <= sp3) ? 100.0 : (sp5 <= sp1 ? 70.0 : 40.0)
+        float wM1 = useSubCount ? 0.35 : 0.45
+        float wM2 = useSubCount ? 0.30 : 0.40
+        float wM3 = useSubCount ? 0.25 : 0.0
+        float wM4 = useSubCount ? 0.10 : 0.15
+        fitImp := impOk ? m1Imp * wM1 + m2Imp * wM2 + m3Imp * wM3 + m4Imp * wM4 : -1.0
+        fitDiag := diagOk ? m1Wedge * wM1 + m2Diag * wM2 + m3Wedge * wM3 + m4Wedge * wM4 : -1.0
+        fitTri := triOk ? m1Wedge * wM1 + m2Tri * wM2 + m3Wedge * wM3 + m4Wedge * wM4 : -1.0
+        float bestFit = math.max(fitImp, math.max(fitDiag, fitTri))
+        if bestFit < floorFit
+            keepImp := false
+            keepDiag := false
+            keepTri := false
+        else
+            keepImp := impOk and fitImp >= bestFit - margin
+            keepDiag := diagOk and fitDiag >= bestFit - margin
+            keepTri := triOk and fitTri >= bestFit - margin
+    [keepImp, keepDiag, keepTri, fitImp, fitDiag, fitTri]
+
+export f_evalWindowTrio(array<float> pP, array<int> pBr, array<float> vP, array<int> vB, int degree, int startIdx, EngineConfig cfg, float rsiSeries, bool enImp, bool enDiag, bool enTri, bool useDisc, float floorFit, float margin, bool useSubCount) =>
+    WaveCount cImp = na
+    if enImp
+        cImp := evaluateImpulseWindow(pP, pBr, vP, vB, degree, startIdx, cfg, rsiSeries)
+    WaveCount cDiag = na
+    if enDiag
+        cDiag := evaluateDiagonalWindow(pP, pBr, vP, vB, degree, startIdx, cfg, rsiSeries)
+    WaveCount cTri = na
+    if enTri
+        cTri := evaluateTriangleWindow(pP, pBr, vP, vB, degree, startIdx, cfg, rsiSeries)
+    bool vImp = not na(cImp) and cImp.hardRulesPassed
+    bool vDiag = not na(cDiag) and cDiag.hardRulesPassed
+    bool vTri = not na(cTri) and cTri.hardRulesPassed
+    if useDisc and (vImp or vDiag or vTri)
+        [kI, kD, kT, fI, fD, fT] = f_discriminateWindow(pP, pBr, vB, startIdx, vImp, vDiag, vTri, floorFit, margin, useSubCount)
+        vImp := kI
+        vDiag := kD
+        vTri := kT
+    [cImp, cDiag, cTri, vImp, vDiag, vTri]
+
+export f_rankStage(WaveCount cA, WaveCount cB, int bandB, array<int> degBand, int maxDeg, string anchorMode, string rankPriority, bool deg2Pref) =>
+    int  stage = 6
+    bool aWins = false
+    if anchorMode == "hard" and cA.anchoredStart != cB.anchoredStart
+        stage := 1
+        aWins := cA.anchoredStart
+    else if rankPriority == "Degree-first (highest degree always wins)" and cA.degree != cB.degree and math.abs(cA.endBar - cB.endBar) <= array.get(degBand, math.min(math.max(math.max(cA.degree, cB.degree), 1), maxDeg))
+        stage := 2
+        aWins := cA.degree > cB.degree
+    else if math.abs(cA.endBar - cB.endBar) > bandB
+        stage := 3
+        aWins := cA.endBar > cB.endBar
+    else if rankPriority == "Recency-first (classic)" and deg2Pref and cA.degree != cB.degree
+        stage := 4
+        aWins := cA.degree > cB.degree
+    else if anchorMode == "prefer" and cA.anchoredStart != cB.anchoredStart
+        stage := 5
+        aWins := cA.anchoredStart
+    else
+        stage := 6
+        aWins := cA.scoreTotal > cB.scoreTotal
+    [stage, aWins]
+
+export compressPivotLevel(array<float> srcP, array<int> srcB, float pctThresh) =>
+    array<float> outP = array.new_float(0)
+    array<int>   outB = array.new_int(0)
+    array<int>   outT = array.new_int(0)
+    array<int>   outS = array.new_int(0)
+    int sn = array.size(srcP)
+    if sn >= 4
+        int   dir = 0
+        float extP = array.get(srcP, 0)
+        int   extI = 0
+        float minP = extP
+        int   minI = 0
+        float maxP = extP
+        int   maxI = 0
+        for k = 1 to sn - 1
+            float pk = array.get(srcP, k)
+            if dir == 0
+                if pk < minP
+                    minP := pk
+                    minI := k
+                if pk > maxP
+                    maxP := pk
+                    maxI := k
+                float baseRef0 = math.min(minP, maxP)
+                if baseRef0 > 0 and (maxP - minP) / baseRef0 * 100.0 >= pctThresh
+                    bool upFirst = maxI > minI
+                    int  firstI = upFirst ? minI : maxI
+                    array.push(outP, upFirst ? minP : maxP)
+                    array.push(outB, array.get(srcB, firstI))
+                    array.push(outT, upFirst ? -1 : 1)
+                    array.push(outS, firstI)
+                    dir := upFirst ? 1 : -1
+                    extP := upFirst ? maxP : minP
+                    extI := upFirst ? maxI : minI
+            else if dir == 1
+                if pk > extP
+                    extP := pk
+                    extI := k
+                else if extP > 0 and (extP - pk) / extP * 100.0 >= pctThresh
+                    array.push(outP, extP)
+                    array.push(outB, array.get(srcB, extI))
+                    array.push(outT, 1)
+                    array.push(outS, extI)
+                    dir := -1
+                    extP := pk
+                    extI := k
+            else
+                if pk < extP
+                    extP := pk
+                    extI := k
+                else if pk > 0 and (pk - extP) / pk * 100.0 >= pctThresh
+                    array.push(outP, extP)
+                    array.push(outB, array.get(srcB, extI))
+                    array.push(outT, -1)
+                    array.push(outS, extI)
+                    dir := 1
+                    extP := pk
+                    extI := k
+        if dir != 0
+            array.push(outP, extP)
+            array.push(outB, array.get(srcB, extI))
+            array.push(outT, dir == 1 ? 1 : -1)
+            array.push(outS, extI)
+    [outP, outB, outT, outS]
+export f_futureTime(int barsFwd) =>
+    time + barsFwd * timeframe.in_seconds() * 1000
+export f_parentGateCheck(WaveCount c, int cP0Time, bool pIsUp, float pInvLvl, int pLastTime, string parentTF, int parentTimeToleranceBars) =>
+    bool timeOk = na(pLastTime) or cP0Time >= pLastTime - parentTimeToleranceBars * timeframe.in_seconds(parentTF) * 1000
+    bool dirOk = true
+    if not na(pInvLvl)
+        float cLo = math.min(c.w1s, math.min(c.w1e, math.min(c.w2e, math.min(nz(c.w3e, c.w1s), math.min(nz(c.w4e, c.w1s), nz(c.w5e, c.w1s))))))
+        float cHi = math.max(c.w1s, math.max(c.w1e, math.max(c.w2e, math.max(nz(c.w3e, c.w1s), math.max(nz(c.w4e, c.w1s), nz(c.w5e, c.w1s))))))
+        dirOk := pIsUp ? cLo > pInvLvl : cHi < pInvLvl
+    [timeOk and dirOk, timeOk, dirOk]
+export offsetAmt(float mult, float atrRef, string labelOffsetUnit, float topPatternRangeForOffset) =>
+    labelOffsetUnit == "ticks" ? mult * syminfo.mintick :
+     labelOffsetUnit == "% of price" ? close * mult / 100.0 :
+     labelOffsetUnit == "% of pattern range" ? (na(topPatternRangeForOffset) or topPatternRangeForOffset <= 0 ? mult * atrRef : topPatternRangeForOffset * mult / 100.0) :
+     mult * atrRef
+f_projTargetLabels(string pt) =>
+    string nxt = "4"
+    string fin = "5"
+    if str.startswith(pt, "Triangle")
+        nxt := "D"
+        fin := "E"
+    else if pt == "Combination (WXY)"
+        nxt := "X"
+        fin := "Y"
+    else if pt == "Combination (WXYXZ)"
+        nxt := "X"
+        fin := "Z"
+    else if pt == "Zigzag" or str.startswith(pt, "Flat")
+        nxt := "B"
+        fin := "C"
+    [nxt, fin]
+
+f_fibZonePush(array<label> tgt, int barT, float priceY, string txtL1, string txtL2, color txtColor, string sizeName) =>
+    lbl = label.new(barT, priceY, txtL1 + "\n" + txtL2, xloc=xloc.bar_time, style=label.style_label_left, color=color.new(txtColor, 85), textcolor=txtColor, size=getLabelSize(sizeName))
+    array.push(tgt, lbl)
+
+f_fibInvalidationLabel(int barT, float priceY, string reason, color invCol, string sizeName) =>
+    label.new(barT, priceY, "Invalidation: " + str.tostring(priceY, "#.##"), xloc=xloc.bar_time, style=label.style_label_left, color=color.new(invCol, 85), textcolor=invCol, size=getLabelSize(sizeName), tooltip="Invalidation level: " + str.tostring(priceY, "#.##") + "\n\nReason: " + reason)
+
+f_fibInvalidationDot(int barT, float priceY, color dotCol, string sizeName) =>
+    label.new(barT, priceY, "", xloc=xloc.bar_time, style=label.style_circle, color=dotCol, size=getLabelSize(sizeName))
+
+export f_fibTargetsDraw(array<label> fibZoneLabels, array<float> zoneOut, float w1s, float w1e, float w2e, float w3e, float w4e, float w5e, string topPatternType, int topStartIdx, float topInvalidationLevel, bool hardRulesValid, int w4eTime, float qPrice, int qTime, int p0Time, int lastPtTime, float lastPtPrice, int w5eTime, bool showFibBoxes, bool showInvalidationLine, bool showInvalidationLabel, int fibBoxExtendBars, color fibBoxColorNear, color fibBoxColorFar, float confluenceTolPct, color confluenceZoneBorderColor, int confluenceZoneBorderWidth, string confluenceZoneBorderStyle, color confluenceZoneBgColor, color confluenceZoneTextColor, string confluenceZoneTextSize, color invalidationColor, string invalidationLineStyle, int invalidationLineWidth, int invalidationRightOffset, color invalidationDotColor, color measRefLineColor, string measRefLineStyle, int measRefLineWidth, color measProjLineColor, string measProjLineStyle, int measProjLineWidth, string fibTextSize, string invalidationLabelSize, string invalidationDotSize, array<label> invLabels) =>
+    var box   fibBoxMin = na
+    var box   fibBoxExt = na
+    var line  invalidationLine = na
+    var label invalidationLabel = na
+    var label invalidationDot = na
+    var box  confluenceBox = na
+    var label confluenceLbl = na
+    var line measRefLine  = na
+    var line measProjLine = na
+
+    if not na(w1s) and hardRulesValid and (showFibBoxes or showInvalidationLine or showInvalidationLabel)
+        box.delete(fibBoxMin)
+        box.delete(fibBoxExt)
+        line.delete(invalidationLine)
+        label.delete(invalidationLabel)
+        label.delete(invalidationDot)
+        box.delete(confluenceBox)
+        label.delete(confluenceLbl)
+        line.delete(measRefLine)
+        line.delete(measProjLine)
+        if array.size(fibZoneLabels) > 0
+            for fzI = 0 to array.size(fibZoneLabels) - 1
+                label.delete(array.get(fibZoneLabels, fzI))
+        array.clear(fibZoneLabels)
+        array.set(zoneOut, 0, na)
+        array.set(zoneOut, 1, na)
+        array.set(zoneOut, 2, na)
+        array.set(zoneOut, 3, na)
+
+        if topPatternType == "Impulse" or str.startswith(topPatternType, "Diagonal")
+            bool isUp = w1e > w1s
+            float wave1Len = math.abs(w1e - w1s)
+            float wave03Len = math.abs(w3e - w1s)
+
+            float targetEquality = isUp ? (w4e + wave1Len) : (w4e - wave1Len)
+            float targetExtension = isUp ? (w4e + 0.618 * wave03Len) : (w4e - 0.618 * wave03Len)
+
+            string noteEq  = (isUp ? close >= targetEquality  : close <= targetEquality)  ? " — REACHED" : ""
+            string noteExt = (isUp ? close >= targetExtension : close <= targetExtension) ? " — REACHED" : ""
+            fibBoxMin := box.new(w4eTime, targetEquality * 1.0005, f_futureTime(fibBoxExtendBars), targetEquality * 0.9995, xloc=xloc.bar_time,
+                         border_color=color.new(fibBoxColorNear, 40), bgcolor=color.new(fibBoxColorNear, 88))
+            array.set(zoneOut, 0, targetEquality * 0.9995)
+            array.set(zoneOut, 1, targetEquality * 1.0005)
+            f_fibZonePush(fibZoneLabels, f_futureTime(fibBoxExtendBars + 1), targetEquality, "Wave 5 Target", "Equality ~" + str.tostring(targetEquality, "#.##") + noteEq, fibBoxColorNear, fibTextSize)
+
+            fibBoxExt := box.new(w4eTime, targetExtension * 1.0005, f_futureTime(fibBoxExtendBars), targetExtension * 0.9995, xloc=xloc.bar_time,
+                         border_color=color.new(fibBoxColorFar, 40), bgcolor=color.new(fibBoxColorFar, 88))
+            array.set(zoneOut, 2, targetExtension * 0.9995)
+            array.set(zoneOut, 3, targetExtension * 1.0005)
+            f_fibZonePush(fibZoneLabels, f_futureTime(fibBoxExtendBars + 1), targetExtension, "Wave 5 Target", "Ext 0.618 ~" + str.tostring(targetExtension, "#.##") + noteExt, fibBoxColorFar, fibTextSize)
+
+            float diffPct = math.abs(targetEquality - targetExtension) / targetEquality * 100
+            if diffPct <= confluenceTolPct
+                confluenceBox := box.new(w4eTime, math.max(targetEquality, targetExtension), f_futureTime(fibBoxExtendBars), math.min(targetEquality, targetExtension), xloc=xloc.bar_time,
+                     border_color=confluenceZoneBorderColor, border_width=confluenceZoneBorderWidth, border_style=f_lineStyle(confluenceZoneBorderStyle),
+                     bgcolor=confluenceZoneBgColor)
+                confluenceLbl := label.new(f_futureTime(fibBoxExtendBars + 1), (targetEquality + targetExtension) / 2.0, "CONFLUENCE ZONE\n~" + str.tostring((targetEquality + targetExtension) / 2.0, "#.##"), xloc=xloc.bar_time,
+                     style=label.style_label_left, color=color.new(confluenceZoneTextColor, 85), textcolor=confluenceZoneTextColor, size=getLabelSize(confluenceZoneTextSize))
+                array.push(fibZoneLabels, confluenceLbl)
+
+            invalidationLine := line.new(w4eTime, topInvalidationLevel, f_futureTime(invalidationRightOffset), topInvalidationLevel, xloc=xloc.bar_time,
+                         color=color.new(invalidationColor, 20), style=f_lineStyle(invalidationLineStyle), width=invalidationLineWidth)
+            if showInvalidationLabel
+                string invReason = str.startswith(topPatternType, "Diagonal") ?
+                     "past Wave 1's end — the developing Diagonal would be fully retraced" :
+                     "past Wave 1's end — violates the Wave 4-vs-Wave 1 no-overlap rule"
+                invalidationLabel := f_fibInvalidationLabel(f_futureTime(invalidationRightOffset + 1), topInvalidationLevel, invReason, invalidationColor, invalidationLabelSize)
+                array.push(invLabels, invalidationLabel)
+                invalidationDot := f_fibInvalidationDot(f_futureTime(invalidationRightOffset), topInvalidationLevel, invalidationDotColor, invalidationDotSize)
+
+        else if (topPatternType == "Zigzag" or topPatternType == "Flat" or str.startswith(topPatternType, "Combination")) and topStartIdx >= 1
+            float qpLen = math.abs(w1s - qPrice)
+            bool reversalUp = w1s > qPrice
+
+            float targetMin = reversalUp ? (lastPtPrice + 0.618 * qpLen) : (lastPtPrice - 0.618 * qpLen)
+            float targetExt = reversalUp ? (lastPtPrice + 1.0 * qpLen)   : (lastPtPrice - 1.0 * qpLen)
+            string noteMin = (reversalUp ? close >= targetMin : close <= targetMin) ? " — REACHED" : ""
+            string noteExtC = (reversalUp ? close >= targetExt : close <= targetExt) ? " — REACHED" : ""
+
+            measRefLine  := line.new(qTime, qPrice, p0Time, w1s, xloc=xloc.bar_time, color=measRefLineColor, style=f_lineStyle(measRefLineStyle), width=measRefLineWidth)
+            measProjLine := line.new(lastPtTime, lastPtPrice, f_futureTime(int(fibBoxExtendBars / 2)), targetExt, xloc=xloc.bar_time, color=measProjLineColor, style=f_lineStyle(measProjLineStyle), width=measProjLineWidth)
+
+            fibBoxMin := box.new(lastPtTime, targetMin * 1.0005, f_futureTime(fibBoxExtendBars), targetMin * 0.9995, xloc=xloc.bar_time,
+                         border_color=color.new(fibBoxColorNear, 40), bgcolor=color.new(fibBoxColorNear, 88))
+            array.set(zoneOut, 0, targetMin * 0.9995)
+            array.set(zoneOut, 1, targetMin * 1.0005)
+            f_fibZonePush(fibZoneLabels, f_futureTime(fibBoxExtendBars + 1), targetMin, "Post-Correction Target", "0.618x of prior leg ~" + str.tostring(targetMin, "#.##") + noteMin, fibBoxColorNear, fibTextSize)
+
+            fibBoxExt := box.new(lastPtTime, targetExt * 1.0005, f_futureTime(fibBoxExtendBars), targetExt * 0.9995, xloc=xloc.bar_time,
+                         border_color=color.new(fibBoxColorFar, 40), bgcolor=color.new(fibBoxColorFar, 88))
+            array.set(zoneOut, 2, targetExt * 0.9995)
+            array.set(zoneOut, 3, targetExt * 1.0005)
+            f_fibZonePush(fibZoneLabels, f_futureTime(fibBoxExtendBars + 1), targetExt, "Post-Correction Target", "1.0x of prior leg ~" + str.tostring(targetExt, "#.##") + noteExtC, fibBoxColorFar, fibTextSize)
+
+            invalidationLine := line.new(lastPtTime, topInvalidationLevel, f_futureTime(invalidationRightOffset), topInvalidationLevel, xloc=xloc.bar_time,
+                         color=color.new(invalidationColor, 20), style=f_lineStyle(invalidationLineStyle), width=invalidationLineWidth)
+            if showInvalidationLabel
+                string invReason = "past the correction's own end (" + (str.startswith(topPatternType, "Combination") ? "final leg" : "Wave C") + ") — the correction would already be fully retraced"
+                invalidationLabel := f_fibInvalidationLabel(f_futureTime(invalidationRightOffset + 1), topInvalidationLevel, invReason, invalidationColor, invalidationLabelSize)
+                array.push(invLabels, invalidationLabel)
+                invalidationDot := f_fibInvalidationDot(f_futureTime(invalidationRightOffset), topInvalidationLevel, invalidationDotColor, invalidationDotSize)
+
+        else if str.startswith(topPatternType, "Triangle")
+            float lenA = math.abs(w1e - w1s)
+            float lenB = math.abs(w2e - w1e)
+            float lenC = math.abs(w3e - w2e)
+            float lenD = math.abs(w4e - w3e)
+            float widestLeg = math.max(math.max(lenA, lenB), math.max(lenC, lenD))
+            bool thrustUp = w1e > w1s
+            float thrustTarget = thrustUp ? (w5e + widestLeg) : (w5e - widestLeg)
+
+            string noteThr = (thrustUp ? close >= thrustTarget : close <= thrustTarget) ? " — REACHED" : ""
+            fibBoxMin := box.new(w5eTime, thrustTarget * 1.0005, f_futureTime(fibBoxExtendBars), thrustTarget * 0.9995, xloc=xloc.bar_time,
+                         border_color=color.new(fibBoxColorNear, 40), bgcolor=color.new(fibBoxColorNear, 88))
+            array.set(zoneOut, 0, thrustTarget * 0.9995)
+            array.set(zoneOut, 1, thrustTarget * 1.0005)
+            f_fibZonePush(fibZoneLabels, f_futureTime(fibBoxExtendBars + 1), thrustTarget, "Thrust Target", "Triangle Width ~" + str.tostring(thrustTarget, "#.##") + noteThr, fibBoxColorNear, fibTextSize)
+
+            invalidationLine := line.new(w5eTime, topInvalidationLevel, f_futureTime(invalidationRightOffset), topInvalidationLevel, xloc=xloc.bar_time,
+                         color=color.new(invalidationColor, 20), style=f_lineStyle(invalidationLineStyle), width=invalidationLineWidth)
+            if showInvalidationLabel
+                string invReason = "past Wave A's end — price has escaped the triangle's own outer boundary"
+                invalidationLabel := f_fibInvalidationLabel(f_futureTime(invalidationRightOffset + 1), topInvalidationLevel, invReason, invalidationColor, invalidationLabelSize)
+                array.push(invLabels, invalidationLabel)
+                invalidationDot := f_fibInvalidationDot(f_futureTime(invalidationRightOffset), topInvalidationLevel, invalidationDotColor, invalidationDotSize)
+
+    if not showInvalidationLine
+        if not na(invalidationLine)
+            line.delete(invalidationLine)
+            invalidationLine := na
+        if not na(invalidationDot)
+            label.delete(invalidationDot)
+            invalidationDot := na
+
+    if not showFibBoxes
+        box.delete(fibBoxMin)
+        fibBoxMin := na
+        box.delete(fibBoxExt)
+        fibBoxExt := na
+        box.delete(confluenceBox)
+        confluenceBox := na
+        label.delete(confluenceLbl)
+        confluenceLbl := na
+        line.delete(measRefLine)
+        measRefLine := na
+        line.delete(measProjLine)
+        measProjLine := na
+        if array.size(fibZoneLabels) > 0
+            for fzD = 0 to array.size(fibZoneLabels) - 1
+                label.delete(array.get(fibZoneLabels, fzD))
+            array.clear(fibZoneLabels)
+        array.set(zoneOut, 0, na)
+        array.set(zoneOut, 1, na)
+        array.set(zoneOut, 2, na)
+        array.set(zoneOut, 3, na)
+    true
+
+export f_waveProjection(array<float> pP, array<int> pB, array<int> pT, bool showProjection, float projectedTargetScaleFactor, bool enableAutoProjScale, bool showProjectionConfluence, float confluenceBandAtr, float atrRef, color projectionColor, color targetProjectedBgColor, string projectionLabelSize, bool hardRulesValid, string topPatternType) =>
+    var box   projBoxW4 = na
+    var box   projBoxW5 = na
+    var line  projLine1 = na
+    var line  projLine2 = na
+    var label projLabel = na
+    var label projTargetLabel = na
+    var float autoProjScale = 1.0
+    var int   autoProjScaleBasisBar = -1
+    box.delete(projBoxW4)
+    box.delete(projBoxW5)
+    line.delete(projLine1)
+    line.delete(projLine2)
+    label.delete(projLabel)
+    label.delete(projTargetLabel)
+
+    if showProjection
+        nP = array.size(pP)
+        if nP >= 4
+            float ps0 = array.get(pP, nP - 4)
+            float pe1 = array.get(pP, nP - 3)
+            float pe2 = array.get(pP, nP - 2)
+            float pe3 = array.get(pP, nP - 1)
+            int   pb3 = array.get(pB, nP - 1)
+
+            if pb3 != autoProjScaleBasisBar
+                autoProjScale := 1.0
+                autoProjScaleBasisBar := pb3
+
+            bool  pIsUp = pe1 > ps0
+            float pLen1 = math.abs(pe1 - ps0)
+            float pLen3 = math.abs(pe3 - pe2)
+            bool  pR1 = pIsUp ? (pe2 > ps0) : (pe2 < ps0)
+            bool  pR3longer = pLen1 > 0 and pLen3 > pLen1 * 0.5
+
+            bool validPartial = pR1 and pR3longer and pLen3 > 0
+
+            if validPartial
+                bool wave3Extended = pLen1 > 0 and pLen3 > pLen1 * 1.5
+                bool wave1Extended = pLen3 > 0 and pLen1 > pLen3 * 1.5
+
+                float w4RetMinPct = wave3Extended ? 0.236 : 0.382
+                float w4RetMaxPct = wave3Extended ? 0.382 : 0.5
+
+                float priorScale = math.max(projectedTargetScaleFactor, autoProjScale)
+                float w4RetraceMinPrior = pIsUp ? (pe3 - w4RetMinPct * pLen3 * priorScale) : (pe3 + w4RetMinPct * pLen3 * priorScale)
+                float w4RetraceMaxPrior = pIsUp ? (pe3 - w4RetMaxPct * pLen3 * priorScale) : (pe3 + w4RetMaxPct * pLen3 * priorScale)
+                float w4MidPrior = (w4RetraceMinPrior + w4RetraceMaxPrior) / 2
+
+                float wave03Len = math.abs(pe3 - ps0)
+
+                float condDist = wave3Extended ? 0.618 * pLen1 : wave1Extended ? pLen3 : 1.618 * wave03Len
+                string condMethod = wave3Extended ? "0.618×Wave1 (Wave 3 extended)" :
+                     wave1Extended ? "≈Wave3 (Wave 1 extended)" :
+                     "1.618×(Wave1-3 dist.) (neither 1 nor 3 extended)"
+                float condTargetPrior = pIsUp ? (w4MidPrior + condDist * priorScale) : (w4MidPrior - condDist * priorScale)
+
+                if enableAutoProjScale and barstate.isconfirmed
+                    bool w4Overshoot = w4RetMaxPct * pLen3 > 0 and (pIsUp ? (low < w4RetraceMaxPrior) : (high > w4RetraceMaxPrior))
+                    float w4ReqScale = w4RetMaxPct * pLen3 > 0 ? (pIsUp ? (pe3 - low) : (high - pe3)) / (w4RetMaxPct * pLen3) : na
+                    bool w5Overshoot = condDist > 0 and (pIsUp ? (high > condTargetPrior) : (low < condTargetPrior))
+                    float w5ReqScale = condDist > 0 ? (pIsUp ? (high - w4MidPrior) : (w4MidPrior - low)) / condDist : na
+
+                    float candidateScale = na
+                    if w4Overshoot and not na(w4ReqScale)
+                        candidateScale := w4ReqScale
+                    if w5Overshoot and not na(w5ReqScale)
+                        candidateScale := na(candidateScale) ? w5ReqScale : math.max(candidateScale, w5ReqScale)
+                    if not na(candidateScale)
+                        autoProjScale := math.min(3.0, math.max(autoProjScale, candidateScale))
+
+                float effectiveProjScale = math.max(projectedTargetScaleFactor, autoProjScale)
+
+                float w4RetraceMin = pIsUp ? (pe3 - w4RetMinPct * pLen3 * effectiveProjScale) : (pe3 + w4RetMinPct * pLen3 * effectiveProjScale)
+                float w4RetraceMax = pIsUp ? (pe3 - w4RetMaxPct * pLen3 * effectiveProjScale) : (pe3 + w4RetMaxPct * pLen3 * effectiveProjScale)
+                float w4Mid = (w4RetraceMin + w4RetraceMax) / 2
+
+                float condTarget = pIsUp ? (w4Mid + condDist * effectiveProjScale) : (w4Mid - condDist * effectiveProjScale)
+
+                float eqTarget  = pIsUp ? (w4Mid + pLen1 * effectiveProjScale) : (w4Mid - pLen1 * effectiveProjScale)
+                float extTarget = pIsUp ? (w4Mid + 0.618 * wave03Len * effectiveProjScale) : (w4Mid - 0.618 * wave03Len * effectiveProjScale)
+
+                float confBand = confluenceBandAtr * atrRef
+                int   confCount = 1
+                float zoneMin = condTarget
+                float zoneMax = condTarget
+                if math.abs(eqTarget - condTarget) <= confBand
+                    confCount += 1
+                    zoneMin := math.min(zoneMin, eqTarget)
+                    zoneMax := math.max(zoneMax, eqTarget)
+                if math.abs(extTarget - condTarget) <= confBand
+                    confCount += 1
+                    zoneMin := math.min(zoneMin, extTarget)
+                    zoneMax := math.max(zoneMax, extTarget)
+                float w5Target = (zoneMin + zoneMax) / 2
+                string confText = confCount >= 2 ? (str.tostring(confCount) + "/3 methods agree (confluence)") : "single-method estimate, no confluence"
+
+                int pbt3 = array.get(pT, nP - 1)
+                int projTimeW4 = f_futureTime(15)
+                int projTimeW5 = f_futureTime(30)
+                projSize = getLabelSize(projectionLabelSize)
+
+                [projNextLbl, projFinalLbl] = f_projTargetLabels(hardRulesValid ? topPatternType : "")
+
+                string scaleInfo = effectiveProjScale > projectedTargetScaleFactor ?
+                     "\n[auto-scaled " + str.tostring(effectiveProjScale, "#.##") + "×,\nmanual " + str.tostring(projectedTargetScaleFactor, "#.##") + "×]" : ""
+
+                projBoxW4 := box.new(pbt3, math.max(w4RetraceMin, w4RetraceMax), projTimeW4, math.min(w4RetraceMin, w4RetraceMax), xloc=xloc.bar_time,
+                     border_color=color.new(projectionColor, 20), bgcolor=targetProjectedBgColor)
+                projTargetLabel := label.new(f_futureTime(16), w4Mid, "Wave " + projNextLbl + " Target\n" + "Projected ~" + str.tostring(w4Mid, "#.##") + scaleInfo,
+                     xloc=xloc.bar_time, style=label.style_label_left, color=targetProjectedBgColor, textcolor=projectionColor, size=projSize)
+
+                projLine1 := line.new(pbt3, pe3, projTimeW4, w4Mid, xloc=xloc.bar_time,
+                     color=projectionColor, style=line.style_dashed, width=1)
+                projLine2 := line.new(projTimeW4, w4Mid, projTimeW5, w5Target, xloc=xloc.bar_time,
+                     color=projectionColor, style=line.style_dashed, width=1)
+
+                if showProjectionConfluence
+                    projBoxW5 := box.new(projTimeW4, math.max(zoneMin, zoneMax), projTimeW5, math.min(zoneMin, zoneMax), xloc=xloc.bar_time,
+                         border_color=color.new(projectionColor, 20), bgcolor=targetProjectedBgColor)
+
+                projLabel := label.new(f_futureTime(32), w5Target, projFinalLbl + "?\n~" + str.tostring(w5Target, "#.##"), xloc=xloc.bar_time, style=label.style_none,
+                     textcolor=projectionColor, size=projSize,
+                     tooltip="Projected Wave " + projFinalLbl + " target zone — sketch only, not confirmed price action.\nMethod: " + condMethod + "\nConfluence: " + confText + "\nDistance scale: " + str.tostring(effectiveProjScale, "#.##") + (effectiveProjScale > projectedTargetScaleFactor ? " (auto-adjusted from manual " + str.tostring(projectedTargetScaleFactor, "#.##") + " — a prior closed bar exceeded the projected zone)" : " (manual, 4.8.2)"))
+    true
+
+
+export f_recPointTime(int barVal, array<int> pivotBars, array<int> pivotTimes, array<int> subPivotBars, array<int> subPivotTimes) =>
+    int t = f_barValToTime(pivotBars, pivotTimes, barVal)
+    na(t) ? f_barValToTime(subPivotBars, subPivotTimes, barVal) : t
+
+export f_szDn(string sz, bool autoSizeStep, int visBarsInView, int autoSizeBars) =>
+    not autoSizeStep or visBarsInView <= autoSizeBars ? sz : sz == "huge" ? "large" : sz == "large" ? "normal" : sz == "normal" ? "small" : "tiny"
+
+export f_dpRelax(array<float> dpScore, array<int> dpPrev, array<int> dpCandIdx, array<WaveCount> candPool, int k, int rangeLen, float base, WaveCount c, int gateTime, string parentGateMode, bool hasValidParentTF, bool parentProxyFound, bool parentProxyIsUp, float parentProxyInvLevel, int parentProxyLastTime, string resolvedParentTF, int parentTimeToleranceBars, float parentGateMalus, float recoveredPivotMalus, float minScoreThreshold, bool enableChainGrammar, float chainGrammarBonus, float chainGrammarMalus, bool enableComboBonus, float comboConsolidationBonus) =>
+    bool improved = false
+    bool gatePass = true
+    if parentGateMode != "Off" and hasValidParentTF and parentProxyFound
+        [gateOk, timeOk, dirOk] = f_parentGateCheck(c, gateTime, parentProxyIsUp, parentProxyInvLevel, parentProxyLastTime, resolvedParentTF, parentTimeToleranceBars)
+        if not gateOk
+            if parentGateMode == "Hard (discard)"
+                gatePass := false
+            else if parentGateMode == "Soft (score malus)"
+                float effGateMalusDp = str.contains(c.countId, "RI") ? math.max(0.0, parentGateMalus - recoveredPivotMalus) : parentGateMalus
+                c.scoreTotal := math.max(0.0, c.scoreTotal - effGateMalusDp)
+    if gatePass and c.hardRulesPassed and c.scoreTotal >= minScoreThreshold
+        int k2 = k + c.legsConsumed
+        if k2 > k and k2 <= rangeLen
+            float edgeDelta = f_dpEdgeModifier(candPool, dpCandIdx, k, c, enableChainGrammar, chainGrammarBonus, chainGrammarMalus, enableComboBonus, comboConsolidationBonus)
+            float w = base + math.max(0.0, c.scoreTotal + edgeDelta) * c.legsConsumed
+            if w > array.get(dpScore, k2)
+                array.set(dpScore, k2, w)
+                array.set(dpPrev, k2, k)
+                array.push(candPool, c)
+                array.set(dpCandIdx, k2, array.size(candPool) - 1)
+                improved := true
+    improved
+
+export f_tagReg(label tgHost, int tgHostLn, bool tgT, bool tgD, int tgDeg, string tgTf, string tgSz, array<label> tagHosts, array<int> tagHostLnA, array<int> tagDegs, array<string> tagTfs, array<int> tagMode, array<string> tagSzs) =>
+    bool tgOn = tgT or tgD
+    if tgOn
+        array.push(tagHosts, tgHost)
+        array.push(tagHostLnA, tgHostLn)
+        array.push(tagDegs, tgDeg)
+        array.push(tagTfs, tgTf)
+        array.push(tagMode, (tgT ? 1 : 0) + (tgD ? 2 : 0))
+        array.push(tagSzs, tgSz)
+    tgOn
